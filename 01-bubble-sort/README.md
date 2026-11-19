@@ -22,6 +22,17 @@ the main menu. The game is drawn at 980×720 and scaled to the screen with its
 proportions kept (black bars on the sides of a 16:9 laptop screen). The window
 can also be resized. The choice is remembered.
 
+**Settings** (main menu) has switches for:
+- **Display**: window or fullscreen,
+- **Scaling**: *smooth* (linear filtering, soft edges) or *sharp* (crisp pixels)
+  when the 980×720 picture is stretched,
+- **Theme**,
+- **Auto-pause** when you leave the window,
+- **Rules first**: the rules card before your first try of a level.
+
+All of them are saved. `--fullscreen` / `--windowed` and `--sharp` / `--smooth`
+on the command line override the saved choice.
+
 Progress (stars, best scores, Endless high score, chosen theme) is stored in
 `save.json` next to the game. Delete it to start over.
 

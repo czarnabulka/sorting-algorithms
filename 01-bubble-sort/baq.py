@@ -31,10 +31,12 @@ In a level:
 
 Anywhere:
   F11 / Alt+Enter     fullscreen on / off (remembered in save.json)
+  Settings (menu)     fullscreen, smooth / sharp scaling, theme, auto-pause,
+                      rules card before the first try
 
 Run:
   pip install pygame
-  python baq.py                # add --fullscreen or --windowed to override
+  python baq.py                # --fullscreen / --windowed, --sharp / --smooth override the settings
 """
 
 import json
@@ -150,7 +152,7 @@ def approach(cur, target, dt, speed=12.0):
 # ------------------------------------------------------------------ saving
 def load_save():
     blank = {"version": 2, "stars": {}, "best": {}, "theme": "aquarium", "endless": 0,
-             "fullscreen": False}
+             "fullscreen": False, "sharp": False, "autopause": True, "briefing": True}
     try:
         with open(SAVE_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -334,6 +336,10 @@ class Game:
             self.save["fullscreen"] = True
         elif "--windowed" in sys.argv:
             self.save["fullscreen"] = False
+        if "--sharp" in sys.argv:
+            self.save["sharp"] = True
+        elif "--smooth" in sys.argv:
+            self.save["sharp"] = False
         self.fullscreen = False
         self.set_display(self.save["fullscreen"])
         self.clock = pygame.time.Clock()
@@ -800,6 +806,10 @@ class Game:
     def set_display(self, fullscreen):
         """The game always draws at W x H; SCALED stretches it to the window or
         the whole screen (keeping the aspect ratio) and maps the mouse back."""
+        # pygame stretches with "nearest" pixels unless told otherwise, which looks
+        # jagged at non-integer scales (720 -> 1080 is 1.5x); "linear" smooths it.
+        # SDL reads this when the window's renderer is created.
+        os.environ["SDL_RENDER_SCALE_QUALITY"] = "nearest" if self.save.get("sharp") else "linear"
         flags = pygame.SCALED | (pygame.FULLSCREEN if fullscreen else pygame.RESIZABLE)
         try:
             self.screen = pygame.display.set_mode((W, H), flags)
@@ -817,12 +827,33 @@ class Game:
         self.save["fullscreen"] = self.fullscreen
         write_save(self.save)
 
+    def set_fullscreen(self, on):
+        if on != self.fullscreen:
+            self.toggle_fullscreen()
+
+    def set_sharp(self, on):
+        """Smooth / sharp scaling: the renderer has to be created again."""
+        if bool(on) == bool(self.save.get("sharp")):
+            return
+        self.save["sharp"] = bool(on)
+        write_save(self.save)
+        snap = self.screen.copy()
+        pygame.display.quit()
+        pygame.display.init()
+        self.set_display(self.fullscreen)
+        self.apply_theme()
+        self.hand = None                          # the new window starts with the arrow cursor
+        self.set_hand(False)
+        self.screen.blit(snap, (0, 0))
+        self.begin_transition("fade", dur=0.3)
+
     def handle(self, e):
         if e.type == pygame.KEYDOWN and (e.key == pygame.K_F11 or
                                          (e.key == pygame.K_RETURN and e.mod & pygame.KMOD_ALT)):
             self.toggle_fullscreen()
             return
-        if e.type == getattr(pygame, "WINDOWFOCUSLOST", -1) and self.scene == "play":
+        if (e.type == getattr(pygame, "WINDOWFOCUSLOST", -1) and self.scene == "play"
+                and self.save.get("autopause", True)):
             self.pause("pause")                   # alt-tab / click outside pauses the level
             return
         getattr(self, f"handle_{self.scene}")(e)
@@ -895,7 +926,9 @@ class Game:
                  ("Endless tide", lambda: self.start_level("endless"), self.endless_unlocked(),
                   f"best {best}" if self.endless_unlocked() else f"clear level {ENDLESS_UNLOCK + 1} to unlock"),
                  ("Theme: " + self.theme.title, lambda: self.go("themes"), True, ""),
-                 ("Fullscreen: " + ("on" if self.fullscreen else "off"), self.toggle_fullscreen, True, "F11"),
+                 ("Settings", lambda: self.go("settings"), True,
+                  ("fullscreen" if self.fullscreen else "window") + " · "
+                  + ("sharp" if self.save.get("sharp") else "smooth")),
                  ("Quit", self.quit, True, "")]
         return [Button((x, 278 + k * 64, w, 54), lbl, act, ok, sub)
                 for k, (lbl, act, ok, sub) in enumerate(items)]
@@ -1291,6 +1324,135 @@ class Game:
         self.apply_theme()
         write_save(self.save)
 
+    # ------------------------------------------------------------ settings
+    def set_theme(self, k):
+        if k != self.theme_idx:
+            self.begin_transition("circle", self.settings_rect(2).center)
+            self.theme_idx = k
+            self.apply_theme()
+            write_save(self.save)
+
+    def set_flag(self, key, on):
+        self.save[key] = bool(on)
+        write_save(self.save)
+
+    def settings_items(self):
+        """(label, option labels, current index, setter(index), description)"""
+        sv = self.save
+        return [
+            ("Display", ["Window", "Fullscreen"], int(self.fullscreen),
+             lambda v: self.set_fullscreen(v == 1),
+             "Fullscreen fills the screen and keeps the proportions. F11 or Alt+Enter switch it anywhere."),
+            ("Scaling", ["Smooth", "Sharp"], int(bool(sv.get("sharp"))),
+             lambda v: self.set_sharp(v == 1),
+             "The game is drawn at 980×720 and stretched to your window or screen: "
+             "smooth edges, or crisp (blocky) pixels."),
+            ("Theme", [{"aquarium": "Aquarium", "garden": "Garden", "fire": "Fire"}.get(th.key, th.title)
+                       for th in self.themes], self.theme_idx, self.set_theme,
+             "Aquarium, Garden or Fire Pit. T switches it anywhere."),
+            ("Auto-pause", ["Off", "On"], int(sv.get("autopause", True)),
+             lambda v: self.set_flag("autopause", v == 1),
+             "Pause a level when you click outside the window or alt-tab away."),
+            ("Rules first", ["Off", "On"], int(sv.get("briefing", True)),
+             lambda v: self.set_flag("briefing", v == 1),
+             "Show the rules card before your first try of a level."),
+        ]
+
+    def settings_rect(self, k):
+        return pygame.Rect(150, 150 + k * 74, W - 300, 60)
+
+    def settings_back_rect(self):
+        return pygame.Rect(W // 2 - 110, 150 + 5 * 74 + 14, 220, 52)
+
+    def option_rects(self, k, n):
+        r = self.settings_rect(k)
+        ow, gap = (380 - (n - 1) * 6) / n, 6
+        x0 = r.right - 14 - 380
+        return [pygame.Rect(int(x0 + i * (ow + gap)), r.y + 12, int(ow), r.h - 24) for i in range(n)]
+
+    def handle_settings(self, e):
+        items = self.settings_items()
+        rows = len(items) + 1                      # + Back
+        if e.type == pygame.KEYDOWN:
+            if e.key == pygame.K_ESCAPE:
+                self.go("menu")
+            elif e.key in (pygame.K_UP, pygame.K_DOWN):
+                self.sel = (self.sel + (1 if e.key == pygame.K_DOWN else -1)) % rows
+            elif self.sel == len(items):
+                if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                    self.go("menu")
+            elif e.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                _, opts, cur, setter, _ = items[self.sel]
+                d = -1 if e.key == pygame.K_LEFT else 1
+                if e.key in (pygame.K_LEFT, pygame.K_RIGHT):
+                    nv = max(0, min(len(opts) - 1, cur + d))
+                else:
+                    nv = (cur + 1) % len(opts)
+                if nv != cur:
+                    setter(nv)
+        elif e.type == pygame.MOUSEMOTION:
+            over = False
+            for k in range(len(items)):
+                if self.settings_rect(k).collidepoint(e.pos):
+                    self.sel = k
+                    over = any(r.collidepoint(e.pos) for r in self.option_rects(k, len(items[k][1])))
+            if self.settings_back_rect().collidepoint(e.pos):
+                self.sel, over = len(items), True
+            self.set_hand(over)
+        elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+            if self.settings_back_rect().collidepoint(e.pos):
+                self.go("menu")
+                return
+            for k, (_, opts, cur, setter, _) in enumerate(items):
+                for i, r in enumerate(self.option_rects(k, len(opts))):
+                    if r.collidepoint(e.pos):
+                        self.sel = k
+                        if i != cur:
+                            setter(i)
+                        return
+
+    def draw_settings(self):
+        s, th = self.screen, self.theme
+        self.otext(self.f_big, "Settings", (W // 2, 80 - 30 * (1 - self.ent(0))), th.accent, 3)
+        items = self.settings_items()
+        mouse = pygame.mouse.get_pos()
+        for k, (label, opts, cur, _, _) in enumerate(items):
+            e_in = self.ent(k + 1, step=0.05)
+            ox = int(120 * (1 - e_in))
+            sel = k == self.sel
+            a = self.smooth(f"set{k}", 1.0 if sel else 0.0)
+            r = self.settings_rect(k).move(ox, 0)
+            self.glow_rect(r, th.accent, 0.8 * a)
+            self.panel(r, 200 + 40 * a)
+            pygame.draw.rect(s, lerp_color(th.dim, th.accent, a), r, 1 + round(2 * a), border_radius=14)
+            img = self.f_mid.render(label, True, lerp_color(th.text, th.accent, a))
+            s.blit(img, img.get_rect(midleft=(r.x + 22, r.centery)))
+            # segmented switch; the highlight slides to the chosen option
+            ors = [o.move(ox, 0) for o in self.option_rects(k, len(opts))]
+            track = ors[0].union(ors[-1]).inflate(8, 8)
+            pygame.draw.rect(s, lerp_color(th.panel_bg, (0, 0, 0), 0.35), track, border_radius=track.h // 2)
+            fx = self.smooth(f"setopt{k}", float(cur), 14)
+            i0 = min(len(ors) - 2, int(fx)) if len(ors) > 1 else 0
+            f = fx - i0
+            hx = ors[i0].x + (ors[min(i0 + 1, len(ors) - 1)].x - ors[i0].x) * f
+            hl = pygame.Rect(int(hx), ors[0].y, ors[0].w, ors[0].h)
+            pygame.draw.rect(s, th.accent, hl, border_radius=hl.h // 2)
+            for i, (o, name) in enumerate(zip(ors, opts)):
+                on = abs(fx - i) < 0.5
+                hov = o.collidepoint(mouse) and not on
+                col = (25, 20, 15) if on else lerp_color(th.dim, th.text, 1.0 if hov else 0.0)
+                img = self.f_small.render(name, True, col)
+                s.blit(img, img.get_rect(center=o.center))
+        # back button
+        b = Button(self.settings_back_rect(), "Back", lambda: None)
+        self.draw_button(b, self.sel == len(items), "setback", int(120 * (1 - self.ent(7, step=0.05))))
+        # description of the selected row
+        if self.sel < len(items):
+            desc = items[self.sel][4]
+            for n, line in enumerate(self.wrap(desc, self.f_small, W - 320)):
+                self.otext(self.f_small, line, (W // 2, H - 96 + n * 20), th.text, 1)
+        self.otext(self.f_small, "↑↓ choose   ←→ change   ESC back", (W // 2, H - 22), th.dim, 1)
+
     def handle_themes(self, e):
         if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
             self.go("menu")
@@ -1340,7 +1502,7 @@ class Game:
         self.go("play")
         self.reset()
         first = (self.save.get("endless", 0) == 0) if self.endless else self.stars(self.level_idx) == 0
-        if first:                          # the first try starts with the rules card
+        if first and self.save.get("briefing", True):   # the first try starts with the rules card
             self.paused = "brief"
 
     @property
