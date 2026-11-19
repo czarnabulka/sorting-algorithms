@@ -55,7 +55,14 @@ Every level has **three stars**, each tied to one idea:
 
 Levels sit on a winding map; a level unlocks once the previous one is solved.
 Badges on the nodes show arrivals (clock), "no wrong swaps" (tally) and
-hidden numbers (eye).
+hidden numbers (eye); hover one to see what it means.
+
+Press **F** on the map (or click *rules & stars* under PLAY) to open the
+**rules card** of the selected level: every rule in plain words (arrivals and
+how often, speed-up, tank size and starting data, twins, rising stream,
+no wrong swaps, hidden numbers) and what each of the three stars asks for.
+←/→ flips through the levels while the card is open. The same card is shown
+before your first try of a level, and whenever you pause.
 
 | # | Level | Tank | Rule | What it teaches |
 |---|-------|------|------|-----------------|
@@ -106,10 +113,12 @@ Pick a theme in *Theme* in the main menu, or press **T** at any time.
 | D | demo: Bubble Sort sorts the tank step by step, then it all surfaces in one chain |
 | SPACE / → (in demo) | pause / one step |
 | + / - | demo speed |
+| P | pause (shows the rules card); leaving the window pauses too |
 | R | restart the level (same arrivals) |
 | N | next level (after solving this one) |
 | T | change theme |
 | F11, Alt+Enter | fullscreen on / off |
+| F (level map) | rules & stars of the selected level |
 | ESC | back (level → map → menu → quit) |
 
 ## Animations

@@ -15,6 +15,7 @@ Stars:  clear the level  ·  make the level's chain  ·  no wrong swaps
 
 Menu:
   Arrows / mouse  choose,  ENTER / click  confirm,  ESC  back
+  F on the level map: rules and star goals of the selected level
 
 In a level:
   Up / Down / wheel   choose a pair of neighbours (or click a pair)
@@ -22,6 +23,7 @@ In a level:
   F / click NEXT      let the next element in now (bonus points)
   D                   DEMO: the algorithm sorts the tank step by step
                       (in demo: SPACE pause, RIGHT one step, +/- speed)
+  P                   pause (shows the rules); leaving the window pauses too
   R                   restart the level
   N                   next level (once this one is solved)
   T                   change theme
@@ -349,6 +351,9 @@ class Game:
         self.shaking = {}                 # locked level cards / buttons that wiggle when clicked
         self.hand = False                 # is the mouse cursor a hand?
         self.glyphs = {}                  # cache of outlined text
+        self.info_open = False            # rules card on the level map
+        self.badge_tip = None
+        self.paused = None                # None | "brief" | "pause" (in a level)
         self.scene = "menu"
         self.sel = 0                      # keyboard selection in menus
         self.level_sel = self.first_unfinished()
@@ -581,10 +586,26 @@ class Game:
             pygame.draw.polygon(s, lerp_color(th.panel_bg, (0, 0, 0), 0.3), pts)
             pygame.draw.polygon(s, lerp_color(th.dim, th.panel_bg, 0.4), pts, 2)
 
-    def draw_icon(self, kind, cx, cy, color):
-        """Tiny vector icons: clock (arrivals), limit (strict), eye (hidden)."""
-        s = self.screen
-        if kind == "clock":
+    def draw_icon(self, kind, cx, cy, color, surf=None):
+        """Tiny vector icons: clock (arrivals), limit (strict), eye (hidden),
+        speed, free (no arrivals), tank, twins, rising."""
+        s = surf or self.screen
+        if kind == "speed":
+            for k in (-5, 1):
+                pygame.draw.lines(s, color, False, [(cx + k, cy - 6), (cx + k + 5, cy), (cx + k, cy + 6)], 2)
+        elif kind == "free":
+            pygame.draw.lines(s, color, False, [(cx - 7, cy - 7), (cx + 7, cy - 7), (cx - 7, cy + 7),
+                                                 (cx + 7, cy + 7), (cx - 7, cy - 7)], 2)
+        elif kind == "tank":
+            pygame.draw.rect(s, color, (cx - 6, cy - 8, 12, 16), 2, border_radius=3)
+            pygame.draw.line(s, color, (cx - 3, cy + 3), (cx + 3, cy + 3), 2)
+        elif kind == "twins":
+            pygame.draw.circle(s, color, (cx - 4, cy), 5, 2)
+            pygame.draw.circle(s, color, (cx + 4, cy), 5, 2)
+        elif kind == "rising":
+            pygame.draw.lines(s, color, False, [(cx - 7, cy + 6), (cx - 2, cy + 1), (cx + 1, cy + 3), (cx + 7, cy - 5)], 2)
+            pygame.draw.polygon(s, color, [(cx + 8, cy - 7), (cx + 2, cy - 6), (cx + 7, cy - 1)])
+        elif kind == "clock":
             pygame.draw.circle(s, color, (cx, cy), 7, 2)
             pygame.draw.line(s, color, (cx, cy), (cx, cy - 4), 2)
             pygame.draw.line(s, color, (cx, cy), (cx + 3, cy + 1), 2)
@@ -596,6 +617,115 @@ class Game:
             pygame.draw.ellipse(s, color, (cx - 8, cy - 5, 16, 10), 2)
             pygame.draw.circle(s, color, (cx, cy), 2)
             pygame.draw.line(s, color, (cx - 8, cy + 6), (cx + 8, cy - 6), 2)
+
+    # --------------------------------------------------- rules / info card
+    START_KIND = {"reversed": "It starts reversed: the worst case.",
+                  "nearly": "It starts nearly sorted: the best case.",
+                  "sinker": "The biggest one starts at the very bottom."}
+
+    def level_rules(self, lv):
+        """(icon, title, description) for every rule of a level."""
+        th = self.theme
+        rules = []
+        if lv.spawn:
+            rules.append(("clock", "Arrivals",
+                          f"A new {th.noun} enters at the bottom every {lv.spawn:g} s (watch the NEXT box). "
+                          "If the tank is full when it comes, the tank overflows and you lose."))
+            if lv.speedup < 1:
+                rules.append(("speed", "Speeding up",
+                              f"Each arrival comes {round((1 - lv.speedup) * 100)}% sooner than the one "
+                              f"before, down to one every {lv.min_spawn:g} s."))
+        else:
+            rules.append(("free", "No arrivals", "Nothing new comes in. Take your time and empty the tank."))
+        rules.append(("tank", f"Tank of {lv.capacity}",
+                      f"At most {lv.capacity} {th.nouns} fit; you start with {lv.start}. "
+                      + self.START_KIND.get(lv.kind, "")))
+        if lv.feed == "dupes":
+            rules.append(("twins", "Twins", "Equal values arrive (labelled a, b, c). Never swap two equal "
+                          "ones: Bubble Sort keeps them in their order, that is what stable means."))
+        if lv.feed == "rising":
+            rules.append(("rising", "Rising stream", "Every newcomer is bigger than the one before, "
+                          "so each one has to travel up the whole tank."))
+        if lv.strict:
+            rules.append(("limit", "No wrong swaps", "Swapping a pair that is already in order (or equal) "
+                          "cracks the tank: the level is lost at once."))
+        if lv.hidden:
+            rules.append(("eye", "Hidden numbers", "The numbers are not shown. Compare the sizes instead."))
+        return rules
+
+    def level_goals(self, lv):
+        if lv.goal is None:
+            return [("Survive", "keep the tank from overflowing as long as you can"),
+                    ("Score", f"chains multiply points; your best is {self.save.get('endless', 0)}"),
+                    ("Clean", "no wrong swaps")]
+        return [("Cleared", f"surface {lv.goal} {self.theme.nouns}"),
+                (f"Chain ×{lv.chain}", f"surface {lv.chain} in a row: sort the top before the biggest gets there"),
+                ("Clean", "never swap a pair that is already in order")]
+
+    def draw_info_card(self, lv, header, footer, p):
+        """A card in the middle of the screen with the rules and the star goals
+        of a level. p (0..1) animates it in and out."""
+        th = self.theme
+        cw, pad = 620, 26
+        tw = cw - 2 * pad - 46
+        rules = [(ic, t, self.wrap(d, self.f_small, tw)) for ic, t, d in self.level_rules(lv)]
+        lesson = self.wrap(lv.lesson, self.f_small, cw - 2 * pad)
+        goals = self.level_goals(lv)
+        title_h = self.f_big.get_height() + 2
+        ch = (pad + 18 + title_h + 20 * len(lesson) + 14
+              + sum(26 + 20 * len(d) + 8 for _, _, d in rules)
+              + 16 + 22 + 3 * 26 + 18 + 24 + pad - 8)
+        card = pygame.Surface((cw, ch), pygame.SRCALPHA)
+        pygame.draw.rect(card, (*th.panel_bg, 250), card.get_rect(), border_radius=16)
+        pygame.draw.rect(card, (*th.accent, 200), card.get_rect(), 2, border_radius=16)
+        y = pad
+        img = self.f_tiny.render(header.upper(), True, th.accent)
+        card.blit(img, (pad, y))
+        y += 18
+        img = self.f_big.render(lv.name, True, th.text)
+        card.blit(img, (pad, y))
+        y += title_h
+        for line in lesson:
+            card.blit(self.f_small.render(line, True, th.dim), (pad, y))
+            y += 20
+        y += 6
+        pygame.draw.line(card, lerp_color(th.panel_bg, th.dim, 0.4), (pad, y), (cw - pad, y), 1)
+        y += 8
+        for icon, title, desc in rules:
+            ic = (pad + 16, y + 13)
+            pygame.draw.circle(card, lerp_color(th.panel_bg, th.accent, 0.18), ic, 16)
+            pygame.draw.circle(card, th.accent, ic, 16, 1)
+            self.draw_icon(icon, ic[0], ic[1], th.accent, card)
+            card.blit(self.f_mid.render(title, True, th.text), (pad + 46, y + 1))
+            y += 26
+            for line in desc:
+                card.blit(self.f_small.render(line, True, th.dim), (pad + 46, y))
+                y += 20
+            y += 8
+        pygame.draw.line(card, lerp_color(th.panel_bg, th.dim, 0.4), (pad, y), (cw - pad, y), 1)
+        y += 12
+        card.blit(self.f_tiny.render("THREE STARS", True, th.accent), (pad, y))
+        y += 22
+        for title, desc in goals:
+            self.draw_star(pad + 12, y + 10, 9, True, surf=card)
+            img = self.f_mid.render(title, True, th.text)
+            card.blit(img, (pad + 30, y))
+            card.blit(self.f_small.render("  " + desc, True, th.dim), (pad + 30 + img.get_width(), y + 2))
+            y += 26
+        y += 10
+        img = self.f_small.render(footer, True, th.dim)
+        card.blit(img, img.get_rect(midtop=(cw // 2, y)))
+
+        veil = pygame.Surface((W, H), pygame.SRCALPHA)
+        veil.fill((0, 0, 0, int(150 * p)))
+        self.screen.blit(veil, (0, 0))
+        sc = 0.9 + 0.1 * ease_out_back(p)
+        center = (W // 2, H // 2 + int(30 * (1 - p)))
+        img = pygame.transform.smoothscale_by(card, sc) if sc != 1 else card
+        img.set_alpha(int(255 * min(1.0, p * 1.5)))
+        rect = img.get_rect(center=center)
+        self.glow_rect(rect, th.accent, 0.5 * p, 16)
+        self.screen.blit(img, rect)
 
     # ---------------------------------------------------------- main loop
     def run(self):
@@ -658,6 +788,7 @@ class Game:
         self.scene = scene
         self.scene_age = 0.0
         self.sel = 0
+        self.info_open = False
         if scene == "levels":
             self.sel = self.level_sel
         elif scene == "themes":
@@ -690,6 +821,9 @@ class Game:
         if e.type == pygame.KEYDOWN and (e.key == pygame.K_F11 or
                                          (e.key == pygame.K_RETURN and e.mod & pygame.KMOD_ALT)):
             self.toggle_fullscreen()
+            return
+        if e.type == getattr(pygame, "WINDOWFOCUSLOST", -1) and self.scene == "play":
+            self.pause("pause")                   # alt-tab / click outside pauses the level
             return
         getattr(self, f"handle_{self.scene}")(e)
 
@@ -861,7 +995,33 @@ class Game:
     def play_button_rect(self):
         return pygame.Rect(W - 90 - 170, 590, 150, 60)
 
+    def rules_link_rect(self):
+        return pygame.Rect(W - 90 - 170, 652, 150, 24)
+
     def handle_levels(self, e):
+        if self.info_open:                       # the rules card is open
+            if e.type == pygame.KEYDOWN:
+                if e.key in (pygame.K_ESCAPE, pygame.K_f, pygame.K_i, pygame.K_BACKSPACE):
+                    self.info_open = False
+                elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                    if self.unlocked(self.sel):
+                        self.info_open = False
+                        self.start_level(self.sel)
+                    else:
+                        self.locked_click(self.sel)
+                elif e.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN):
+                    d = 1 if e.key in (pygame.K_RIGHT, pygame.K_DOWN) else -1
+                    self.sel = self.level_sel = (self.sel + d) % len(LEVELS)
+            elif e.type == pygame.MOUSEBUTTONDOWN:
+                self.info_open = False
+            return
+        if e.type == pygame.KEYDOWN and e.key in (pygame.K_f, pygame.K_i):
+            self.info_open = True
+            return
+        if (e.type == pygame.MOUSEBUTTONDOWN and e.button == 1
+                and self.rules_link_rect().collidepoint(e.pos)):
+            self.info_open = True
+            return
         if e.type == pygame.KEYDOWN:
             if e.key == pygame.K_ESCAPE:
                 self.go("menu")
@@ -897,7 +1057,8 @@ class Game:
         if e.type == pygame.MOUSEMOTION:
             # hover over a node only highlights it; the selection changes on click
             over = any(b.rect.collidepoint(e.pos) and b.enabled for b in self.level_buttons())
-            self.set_hand(over or self.play_button_rect().collidepoint(e.pos))
+            self.set_hand(over or self.play_button_rect().collidepoint(e.pos)
+                          or self.rules_link_rect().collidepoint(e.pos))
             return
         if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
             for i, b in enumerate(self.level_buttons()):
@@ -980,6 +1141,7 @@ class Game:
 
         # --- nodes (pop in one after another along the path)
         current = self.first_unfinished()
+        self.badge_tip = None
         for i, b in enumerate(self.level_buttons()):
             pop = self.ent(i, step=0.06, dur=0.45, delay=0.08, back=True)
             if pop <= 0.02:
@@ -1022,15 +1184,31 @@ class Game:
             icons = [k for k, on in (("clock", lv.spawn), ("limit", lv.strict), ("eye", lv.hidden)) if on]
             for k, icon in enumerate(icons):             # rule badges in the corner of the node
                 bx, by = x + r - 2 + k * 22, y - r + 4
+                if math.hypot(mouse[0] - bx, mouse[1] - by) < 13 and not self.info_open:
+                    tip = {"clock": f"arrival every {lv.spawn:g} s" if lv.spawn else "",
+                           "limit": "no wrong swaps", "eye": "hidden numbers"}[icon]
+                    self.badge_tip = (tip, bx, by)
                 pygame.draw.circle(s, th.panel_bg, (bx, by), 11)
                 pygame.draw.circle(s, th.dim, (bx, by), 11, 1)
                 self.draw_icon(icon, bx, by, th.text if b.enabled else th.dim)
             name_col = lerp_color(th.dim, th.text, a) if b.enabled else lerp_color(th.dim, th.panel_bg, 0.3)
             self.otext(self.f_small, lv.name, (x, y + r + 36), name_col, 1)
 
+        if self.badge_tip:                               # tooltip over a rule badge
+            tip, bx, by = self.badge_tip
+            img = self.f_tiny.render(tip.upper() + "  ·  F RULES", True, th.text)
+            r = img.get_rect(midbottom=(bx, by - 16)).inflate(18, 10)
+            r.clamp_ip(s.get_rect())
+            self.card(r, 0.08, 240, r.h // 2, (*th.accent, 200))
+            s.blit(img, img.get_rect(center=r.center))
         self.draw_level_card(int(170 * (1 - self.ent(4, dur=0.55))))
-        hint = "arrows choose  ·  ENTER play  ·  T theme  ·  ESC back"
+        hint = "arrows choose  ·  ENTER play  ·  F rules  ·  T theme  ·  ESC back"
         self.otext(self.f_small, hint, (W // 2, H - 16), th.dim, 1)
+        p = self.smooth("info", 1.0 if self.info_open else 0.0, 12)
+        if p > 0.02:
+            ok = self.unlocked(self.sel)
+            self.draw_info_card(LEVELS[self.sel], f"Level {self.sel + 1}  ·  rules",
+                                ("ENTER play   ·   " if ok else "locked   ·   ") + "←→ other levels   ·   F / ESC close", p)
 
     def draw_level_card(self, oy=0):
         """Details of the selected level with a big PLAY button."""
@@ -1080,6 +1258,11 @@ class Game:
             self.draw_lock(pr.x + 32, pr.centery + 6)
             img = self.f_mid.render("Locked", True, th.dim)
             s.blit(img, img.get_rect(midleft=(pr.x + 54, pr.centery)))
+        lr = self.rules_link_rect().move(0, oy)           # "F rules & stars" link
+        a = self.smooth("ruleslink", 1.0 if lr.collidepoint(pygame.mouse.get_pos()) else 0.0)
+        kw = self.keycap("F", lr.x + 10, lr.y)
+        img = self.f_small.render("rules & stars", True, lerp_color(th.dim, th.accent, a))
+        s.blit(img, img.get_rect(midleft=(lr.x + 16 + kw, lr.centery)))
 
     def draw_lock(self, cx, cy):
         c = self.theme.dim
@@ -1156,13 +1339,21 @@ class Game:
         self.seed = random.randrange(1 << 30)
         self.go("play")
         self.reset()
+        first = (self.save.get("endless", 0) == 0) if self.endless else self.stars(self.level_idx) == 0
+        if first:                          # the first try starts with the rules card
+            self.paused = "brief"
 
     @property
     def endless(self):
         return self.level.goal is None
 
+    def pause(self, kind="pause"):
+        if self.scene == "play" and not self.result and not self.paused and not self.demo_finale:
+            self.paused = kind
+
     def reset(self):
         lv = self.level
+        self.paused = None
         self.board = Board(self.start_values, lv.capacity)
         self.feed = Feed(lv, random.Random(self.seed))   # the same arrivals after a restart
         self.queue = []
@@ -1403,6 +1594,22 @@ class Game:
         return pygame.Rect(18, BOTTOM - 196, 100, 262)
 
     def handle_play(self, e):
+        if self.paused:
+            if e.type == pygame.KEYDOWN:
+                if e.key == pygame.K_ESCAPE:
+                    self.go("menu" if self.endless else "levels")
+                elif e.key == pygame.K_t:
+                    self.cycle_theme((COL_X, H // 2))
+                elif e.key == pygame.K_r:
+                    self.reset()
+                elif e.key in (pygame.K_p, pygame.K_SPACE, pygame.K_RETURN, pygame.K_KP_ENTER):
+                    self.paused = None
+            elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                self.paused = None
+            return
+        if e.type == pygame.KEYDOWN and e.key == pygame.K_p:
+            self.pause("pause")
+            return
         if e.type == pygame.KEYDOWN:
             self.on_key(e.key)
         elif e.type == pygame.MOUSEWHEEL and not self.demo and not self.result and self.board.n >= 2:
@@ -1463,6 +1670,11 @@ class Game:
     # --- update
     def update_play(self, dt):
         b, th = self.board, self.theme
+        if self.paused:                    # time stands still, only settle the animations
+            b.update(dt)
+            self.set_hand(False)
+            self.hover_a = approach(self.hover_a, 0.0, dt, 16)
+            return
         # which pair is under the mouse?
         interactive = (not self.demo and not self.result and not self.demo_finale
                        and pygame.mouse.get_focused())
@@ -1732,6 +1944,18 @@ class Game:
         self.draw_panel()
         if self.result:
             self.draw_result()
+        p = self.smooth("pause", 1.0 if self.paused else 0.0, 12)
+        if p > 0.02:
+            head = "Endless tide" if self.endless else f"Level {self.level_idx + 1}"
+            if self.paused == "brief" or (not self.paused and self.ui.get("was_brief")):
+                self.ui["was_brief"] = self.paused == "brief" or p > 0.05
+                self.draw_info_card(self.level, f"{head}  ·  before you start",
+                                    "SPACE / click start   ·   ESC back", p)
+            else:
+                self.draw_info_card(self.level, f"{head}  ·  paused",
+                                    "P / SPACE resume   ·   R restart   ·   ESC back", p)
+        else:
+            self.ui["was_brief"] = False
 
     def draw_panel(self):
         """Right side: header, stat tiles, goals, message, pseudocode, controls."""
@@ -1854,7 +2078,7 @@ class Game:
         else:
             rows = [((["↑", "↓"], "choose pair"), (["SPACE"], "swap")),
                     ((["F"], "next one now"), (["D"], "watch demo")),
-                    ((["R"], "restart"), (["N"], "next level")),
+                    ((["R"], "restart"), (["P"], "pause & rules")),
                     ((["T"], "theme"), (["ESC"], "back"))]
         for r_i, row in enumerate(rows):
             ry = 536 + off + r_i * 29
