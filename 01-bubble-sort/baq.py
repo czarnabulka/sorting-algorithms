@@ -27,9 +27,12 @@ In a level:
   T                   change theme
   ESC                 back
 
+Anywhere:
+  F11 / Alt+Enter     fullscreen on / off (remembered in save.json)
+
 Run:
   pip install pygame
-  python baq.py
+  python baq.py                # add --fullscreen or --windowed to override
 """
 
 import json
@@ -144,7 +147,8 @@ def approach(cur, target, dt, speed=12.0):
 
 # ------------------------------------------------------------------ saving
 def load_save():
-    blank = {"version": 2, "stars": {}, "best": {}, "theme": "aquarium", "endless": 0}
+    blank = {"version": 2, "stars": {}, "best": {}, "theme": "aquarium", "endless": 0,
+             "fullscreen": False}
     try:
         with open(SAVE_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -323,9 +327,14 @@ class Game:
 
     def __init__(self):
         pygame.init()
-        self.screen = pygame.display.set_mode((W, H))
-        self.clock = pygame.time.Clock()
         self.save = load_save()
+        if "--fullscreen" in sys.argv:
+            self.save["fullscreen"] = True
+        elif "--windowed" in sys.argv:
+            self.save["fullscreen"] = False
+        self.fullscreen = False
+        self.set_display(self.save["fullscreen"])
+        self.clock = pygame.time.Clock()
         self.themes = [cls() for cls in THEMES]
         self.fontsets = load_fontsets([th.key for th in self.themes])
         keys = [th.key for th in self.themes]
@@ -656,7 +665,32 @@ class Game:
         elif scene == "menu":
             self.menu_demo_reset()
 
+    # ------------------------------------------------------- fullscreen
+    def set_display(self, fullscreen):
+        """The game always draws at W x H; SCALED stretches it to the window or
+        the whole screen (keeping the aspect ratio) and maps the mouse back."""
+        flags = pygame.SCALED | (pygame.FULLSCREEN if fullscreen else pygame.RESIZABLE)
+        try:
+            self.screen = pygame.display.set_mode((W, H), flags)
+            self.fullscreen = fullscreen
+        except pygame.error:
+            self.screen = pygame.display.set_mode((W, H))
+            self.fullscreen = False
+
+    def toggle_fullscreen(self):
+        try:
+            pygame.display.toggle_fullscreen()
+            self.fullscreen = not self.fullscreen
+        except pygame.error:
+            self.set_display(not self.fullscreen)
+        self.save["fullscreen"] = self.fullscreen
+        write_save(self.save)
+
     def handle(self, e):
+        if e.type == pygame.KEYDOWN and (e.key == pygame.K_F11 or
+                                         (e.key == pygame.K_RETURN and e.mod & pygame.KMOD_ALT)):
+            self.toggle_fullscreen()
+            return
         getattr(self, f"handle_{self.scene}")(e)
 
     def update(self, dt):
@@ -727,8 +761,9 @@ class Game:
                  ("Endless tide", lambda: self.start_level("endless"), self.endless_unlocked(),
                   f"best {best}" if self.endless_unlocked() else f"clear level {ENDLESS_UNLOCK + 1} to unlock"),
                  ("Theme: " + self.theme.title, lambda: self.go("themes"), True, ""),
+                 ("Fullscreen: " + ("on" if self.fullscreen else "off"), self.toggle_fullscreen, True, "F11"),
                  ("Quit", self.quit, True, "")]
-        return [Button((x, 282 + k * 70, w, 56), lbl, act, ok, sub)
+        return [Button((x, 278 + k * 64, w, 54), lbl, act, ok, sub)
                 for k, (lbl, act, ok, sub) in enumerate(items)]
 
     def menu_demo_reset(self):
@@ -798,7 +833,7 @@ class Game:
         for i, b in enumerate(self.menu_buttons()):
             ox = int(90 * (1 - self.ent(i + 2, step=0.06)))
             self.draw_button(b, i == self.sel, f"menu{i}", ox)
-        self.otext(self.f_small, "↑↓ choose   ENTER confirm   T theme   ESC quit",
+        self.otext(self.f_small, "↑↓ choose   ENTER confirm   T theme   F11 fullscreen   ESC quit",
                    (720, H - 30), th.dim, 1)
 
     # -------------------------------------------------------- level select

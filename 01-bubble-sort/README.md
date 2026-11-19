@@ -14,7 +14,13 @@ while the tank is full, the tank overflows and you lose.
 ```bash
 pip install pygame        # or: sudo apt install python3-pygame
 python baq.py
+python baq.py --fullscreen   # or start in fullscreen
 ```
+
+**Fullscreen**: press **F11** (or Alt+Enter) anywhere, or use *Fullscreen* in
+the main menu. The game is drawn at 980×720 and scaled to the screen with its
+proportions kept (black bars on the sides of a 16:9 laptop screen). The window
+can also be resized. The choice is remembered.
 
 Progress (stars, best scores, Endless high score, chosen theme) is stored in
 `save.json` next to the game. Delete it to start over.
@@ -103,6 +109,7 @@ Pick a theme in *Theme* in the main menu, or press **T** at any time.
 | R | restart the level (same arrivals) |
 | N | next level (after solving this one) |
 | T | change theme |
+| F11, Alt+Enter | fullscreen on / off |
 | ESC | back (level → map → menu → quit) |
 
 ## Animations
