@@ -1,12 +1,17 @@
 """
 BUBBLE SORT QUEST: a game that teaches Bubble Sort
 
-Rules:
-  A column holds numbered elements (bubbles, raindrops or fireballs, depending
-  on the theme). Bigger elements want to rise to the top. You may only swap
-  TWO NEIGHBOURING elements, exactly like Bubble Sort does.
-  Goal: order them from smallest (bottom) to largest (top) using as few
-  swaps as possible.
+Goal:
+  A tank holds numbered elements (bubbles, raindrops or fireballs, depending
+  on the theme). You may only swap TWO NEIGHBOURS, exactly like Bubble Sort.
+  The element on top SURFACES (leaves the tank, gives points) when it is the
+  biggest one in the tank, just like the largest element reaches its final
+  place after a Bubble Sort pass. Several in a row make a CHAIN (x2, x3, ...),
+  which is only possible when the top of the column is already sorted.
+  In most levels new elements arrive from below every few seconds; if one
+  arrives while the tank is full, the tank overflows and you lose.
+
+Stars:  clear the level  ·  make the level's chain  ·  no wrong swaps
 
 Menu:
   Arrows / mouse  choose,  ENTER / click  confirm,  ESC  back
@@ -14,12 +19,13 @@ Menu:
 In a level:
   Up / Down / wheel   choose a pair of neighbours (or click a pair)
   SPACE / click       swap the selected pair (click it once more)
-  D                   DEMO: the algorithm sorts the same data step by step
+  F / click NEXT      let the next element in now (bonus points)
+  D                   DEMO: the algorithm sorts the tank step by step
                       (in demo: SPACE pause, RIGHT one step, +/- speed)
   R                   restart the level
   N                   next level (once this one is solved)
   T                   change theme
-  ESC                 back to the level list
+  ESC                 back
 
 Run:
   pip install pygame
@@ -34,16 +40,19 @@ import sys
 
 import pygame
 
-from levels import LEVELS, VMAX, make_values
-from themes import THEMES, W, H, lerp_color, text_outlined
+from fonts import load_fontsets
+from levels import ENDLESS, LEVELS, VMAX, Feed, make_values
+from themes import THEMES, W, H, lerp_color
 
 FPS = 60
 COL_X = 250            # x centre of the element column
-BOTTOM = H - 80        # y of the lowest element
-TOP = 110              # y of the highest element
+BOTTOM = H - 80        # y of the lowest slot
+TOP = 120              # y of the highest slot
+SURFACE_Y = TOP - 62   # where surfacing elements pop
 PANEL_X = 480          # left edge of the info panel
 SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "save.json")
-FONTS = "dejavusans,freesans,arial"
+ENDLESS_UNLOCK = 3     # index of the level that unlocks Endless
+OUTLINE = (10, 10, 20)
 
 
 # ----------------------------------------------------------- algorithm logic
@@ -72,13 +81,28 @@ def bubble_sort_steps(values):
     yield ("done", 0, 0)
 
 
-def count_stats(values):
-    """How many comparisons and swaps Bubble Sort makes on this data."""
-    comps = swaps = 0
-    for kind, _, _ in bubble_sort_steps(values):
-        comps += kind == "compare"
-        swaps += kind == "swap"
-    return comps, swaps
+def inversions(values):
+    """Pairs that are in the wrong order. Every correct neighbour swap fixes
+    exactly one, so this is also the number of swaps Bubble Sort still needs."""
+    return sum(1 for i in range(len(values)) for j in range(i + 1, len(values))
+               if values[i] > values[j])
+
+
+def chain_start(values):
+    """Index from which the top of the column would surface in one chain."""
+    n = len(values)
+    if n == 0:
+        return 0
+    pm, best = [], -1
+    for v in values:
+        best = max(best, v)
+        pm.append(best)
+    if values[-1] != pm[-1]:
+        return n
+    s = n - 1
+    while s > 0 and values[s - 1] == pm[s - 1]:
+        s -= 1
+    return s
 
 
 PSEUDOCODE = [
@@ -94,9 +118,17 @@ STEP_LINE = {"compare": 3, "swap": 4, "keep": 2, "pass_end": 0, "early": 6, "don
 
 
 # ------------------------------------------------------------------ easing
+def clamp01(p):
+    return 0.0 if p < 0 else 1.0 if p > 1 else p
+
+
 def ease_in_out(p):
     """Slow start, fast middle, slow end (cubic)."""
     return 4 * p ** 3 if p < 0.5 else 1 - (-2 * p + 2) ** 3 / 2
+
+
+def ease_out_cubic(p):
+    return 1 - (1 - p) ** 3
 
 
 def ease_out_back(p):
@@ -112,13 +144,17 @@ def approach(cur, target, dt, speed=12.0):
 
 # ------------------------------------------------------------------ saving
 def load_save():
+    blank = {"version": 2, "stars": {}, "best": {}, "theme": "aquarium", "endless": 0}
     try:
         with open(SAVE_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        return {"stars": dict(data.get("stars", {})), "best": dict(data.get("best", {})),
-                "theme": data.get("theme", "aquarium")}
-    except (OSError, ValueError, AttributeError):
-        return {"stars": {}, "best": {}, "theme": "aquarium"}
+        if data.get("version") != 2:          # progress from the old swap-count game
+            blank["theme"] = data.get("theme", "aquarium")
+            return blank
+        blank.update({k: data[k] for k in blank if k in data})
+        return blank
+    except (OSError, ValueError, AttributeError, TypeError):
+        return blank
 
 
 def write_save(data):
@@ -134,8 +170,8 @@ class Element:
     def __init__(self, value, y, uid, label=""):
         self.value = value
         self.y = y                 # current (animated) position
-        self.uid = uid             # starting position, used to check stability
-        self.label = label         # "a", "b", "c" for equal values
+        self.uid = uid
+        self.label = label         # "a", "b", "c" for equal values (arrival order)
         self.phase = random.uniform(0, math.tau)
         # swap animation: the two elements pass each other on curved paths
         self.from_y = self.to_y = y
@@ -144,59 +180,50 @@ class Element:
         self.x_off = 0.0
         self.scale = 1.0           # smoothed size multiplier (hover, swap)
         self.hover = False
-        self.pop = 0.0             # 1 -> 0 springy bump (win wave, sorted)
+        self.pop = 0.0             # 1 -> 0 springy bump (win wave, arrival)
         self.pop_delay = 0.0
 
 
 class Board:
     """The column of elements: positions, swap animation and drawing."""
 
-    SWAP_TIME = 0.32           # seconds per swap animation
+    SWAP_TIME = 0.28           # seconds per swap animation
 
-    def __init__(self, values, col_x=COL_X, top=TOP, bottom=BOTTOM, intro=True):
+    def __init__(self, values, capacity=None, col_x=COL_X, top=TOP, bottom=BOTTOM, intro=True):
         self.col_x, self.top, self.bottom = col_x, top, bottom
-        n = len(values)
-        counts = {v: values.count(v) for v in values}
-        seen = {}
+        self.cap = max(2, capacity or len(values))
         self.items = []
+        self.next_uid = 0
+        self.seen = {}
         for i, v in enumerate(values):
-            label = ""
-            if counts[v] > 1:
-                label = "abc"[seen.get(v, 0)]
-                seen[v] = seen.get(v, 0) + 1
-            self.items.append(Element(v, self.slot_y(i, n), i, label))
+            self.items.append(self.make(v, self.slot_y(i)))
         if intro:                  # elements rise into place one after another
             for i, e in enumerate(self.items):
                 e.y = H + 60 + i * 55
+
+    def make(self, v, y):
+        label = "abcdefgh"[self.seen.get(v, 0) % 8]
+        self.seen[v] = self.seen.get(v, 0) + 1
+        self.next_uid += 1
+        return Element(v, y, self.next_uid, label)
 
     @property
     def n(self):
         return len(self.items)
 
-    def slot_y(self, i, n=None):
-        """Index 0 = bottom, index n-1 = top."""
-        n = n or self.n
-        return self.bottom - i * (self.bottom - self.top) / (n - 1)
+    @property
+    def step(self):
+        return (self.bottom - self.top) / (self.cap - 1)
+
+    def slot_y(self, i):
+        """Index 0 = bottom, index cap-1 = top."""
+        return self.bottom - i * self.step
 
     def radius(self, value):
-        step = (self.bottom - self.top) / (self.n - 1)
-        return int(min(step * 0.48, 46) * (0.45 + 0.55 * value / VMAX))
+        return int(min(self.step * 0.48, 46) * (0.45 + 0.55 * value / VMAX))
 
     def values(self):
         return [e.value for e in self.items]
-
-    def is_sorted(self):
-        v = self.values()
-        return v == sorted(v)
-
-    def is_stable(self):
-        """Equal values still in their original order?"""
-        last = {}
-        for e in self.items:
-            if e.uid < last.get(e.value, -1):
-                return False
-            last[e.value] = e.uid
-        return True
 
     def swap(self, j):
         a, b = self.items[j], self.items[j + 1]
@@ -204,6 +231,17 @@ class Board:
         for e, idx, side in ((a, j + 1, 1), (b, j, -1)):
             e.from_y, e.to_y = e.y, self.slot_y(idx)
             e.anim, e.side = 0.0, side
+
+    def arrive(self, v):
+        """A new element enters at the bottom and pushes the others up."""
+        for e in self.items:
+            if e.anim < 1:
+                e.from_y -= self.step
+                e.to_y -= self.step
+        e = self.make(v, self.bottom + 110)
+        e.pop = 1.0
+        self.items.insert(0, e)
+        return e
 
     def pop_wave(self, delay=0.07):
         """Bounce every element, bottom to top, like a wave."""
@@ -213,6 +251,9 @@ class Board:
     @property
     def busy(self):
         return any(e.anim < 1 for e in self.items)
+
+    def settled(self, i):
+        return abs(self.items[i].y - self.slot_y(i)) < 8 and self.items[i].anim >= 1
 
     def update(self, dt):
         for i, e in enumerate(self.items):
@@ -234,68 +275,75 @@ class Board:
     def x_of(self, e, t):
         return self.col_x + math.sin(t * 1.5 + e.phase) * 4 + e.x_off
 
-    def pop_scale(self, e):
+    @staticmethod
+    def pop_scale(e):
         if e.pop <= 0 or e.pop_delay > 0:
             return 1.0
         return 1 + 0.35 * math.sin(math.pi * (1 - e.pop)) * e.pop
 
     def pair_at(self, pos):
         """Pair index (j, j+1) whose middle is closest to the mouse, or None."""
+        if self.n < 2:
+            return None
         x, y = pos
-        if abs(x - self.col_x) > 100 or not (self.top - 50 <= y <= self.bottom + 50):
+        if abs(x - self.col_x) > 100 or not (self.slot_y(self.n - 1) - 50 <= y <= self.bottom + 50):
             return None
         mids = [(self.slot_y(j) + self.slot_y(j + 1)) / 2 for j in range(self.n - 1)]
         return min(range(self.n - 1), key=lambda j: abs(mids[j] - y))
 
-    def draw(self, s, theme, font, t, sorted_from, hidden=False, dx=0):
+    def draw(self, s, theme, font, t, ring_from, hidden=False, dx=0, labels=True):
+        vals = self.values()
         # moving elements are drawn last, so they pass in front of the others
         order = sorted(range(self.n), key=lambda i: (self.items[i].anim < 1, self.items[i].side))
         for i in order:
             e = self.items[i]
-            ring = theme.accent if i >= sorted_from else None
+            ring = theme.accent if i >= ring_from else None
             r = int(self.radius(e.value) * e.scale * self.pop_scale(e))
+            label = e.label if labels and vals.count(e.value) > 1 else ""
             theme.draw_element(s, font, self.x_of(e, t) + dx, e.y, r,
-                               e.value, VMAX, t, ring, e.label, e.phase, hidden)
+                               e.value, VMAX, t, ring, label, e.phase, hidden)
 
 
 # ------------------------------------------------------------------ buttons
 class Button:
-    def __init__(self, rect, label, action, enabled=True):
+    def __init__(self, rect, label, action, enabled=True, sub=""):
         self.rect = pygame.Rect(rect)
-        self.label, self.action, self.enabled = label, action, enabled
+        self.label, self.action, self.enabled, self.sub = label, action, enabled, sub
+
+
+def _font(role):
+    return property(lambda self: self.fontsets[self.theme.key][role])
 
 
 # --------------------------------------------------------------------- game
 class Game:
+    f_title, f_big, f_head, f_mid = _font("title"), _font("big"), _font("head"), _font("mid")
+    f_small, f_tiny, f_value, f_elem = _font("small"), _font("tiny"), _font("value"), _font("elem")
+    f_code = _font("code")
+
     def __init__(self):
         pygame.init()
         self.screen = pygame.display.set_mode((W, H))
         self.clock = pygame.time.Clock()
-        self.f_title = pygame.font.SysFont(FONTS, 54, bold=True)
-        self.f_big = pygame.font.SysFont(FONTS, 34, bold=True)
-        self.f_head = pygame.font.SysFont(FONTS, 27, bold=True)
-        self.f_mid = pygame.font.SysFont(FONTS, 20, bold=True)
-        self.f_small = pygame.font.SysFont(FONTS, 16)
-        self.f_tiny = pygame.font.SysFont(FONTS, 12, bold=True)
-        self.f_value = pygame.font.SysFont(FONTS, 26, bold=True)
-        self.f_code = pygame.font.SysFont("dejavusansmono,monospace", 15)
-
         self.save = load_save()
         self.themes = [cls() for cls in THEMES]
+        self.fontsets = load_fontsets([th.key for th in self.themes])
         keys = [th.key for th in self.themes]
         self.theme_idx = keys.index(self.save["theme"]) if self.save["theme"] in keys else 0
         self.apply_theme()
 
         self.t = 0.0
         self.dt = 1 / FPS
-        self.fade = 1.0                   # 1 = black screen, fades out after a scene change
+        self.trans = None                 # screen transition (snapshot of the old frame)
+        self.scene_age = 0.0              # drives the entrance animations
         self.ui = {}                      # smoothed hover amounts of buttons, keyed by name
-        self.shaking = {}                 # locked level cards that wiggle when clicked
+        self.shaking = {}                 # locked level cards / buttons that wiggle when clicked
         self.hand = False                 # is the mouse cursor a hand?
+        self.glyphs = {}                  # cache of outlined text
         self.scene = "menu"
         self.sel = 0                      # keyboard selection in menus
         self.level_sel = self.first_unfinished()
-        self.demo_delay = 0.7
+        self.demo_delay = 0.6
         self.menu_demo_reset()
 
     # ---------------------------------------------------------- helpers
@@ -304,7 +352,7 @@ class Game:
         return self.themes[self.theme_idx]
 
     def apply_theme(self):
-        pygame.display.set_caption(f"{self.theme.title}: Bubble Sort")
+        pygame.display.set_caption(f"{self.theme.title}: Bubble Sort Quest")
         self.save["theme"] = self.theme.key
 
     def stars(self, idx):
@@ -313,11 +361,58 @@ class Game:
     def unlocked(self, idx):
         return idx == 0 or self.stars(idx - 1) > 0
 
+    def endless_unlocked(self):
+        return self.stars(ENDLESS_UNLOCK) > 0
+
     def first_unfinished(self):
         for i in range(len(LEVELS)):
             if self.stars(i) == 0:
                 return i
         return 0
+
+    def ent(self, k=0, step=0.06, dur=0.5, delay=0.04, back=False):
+        """Entrance progress 0 -> 1 of the k-th thing on a freshly opened screen."""
+        p = clamp01((self.scene_age - delay - k * step) / dur)
+        return ease_out_back(p) if back else ease_out_cubic(p)
+
+    def outlined(self, font, txt, color, outline=OUTLINE, width=2):
+        """Text with a dark outline (cached: it is drawn every frame)."""
+        key = (id(font), txt, tuple(color), outline, width)
+        img = self.glyphs.get(key)
+        if img is None:
+            if len(self.glyphs) > 3000:
+                self.glyphs.clear()
+            base = font.render(txt, True, outline)
+            fg = font.render(txt, True, color)
+            img = pygame.Surface((fg.get_width() + 2 * width, fg.get_height() + 2 * width), pygame.SRCALPHA)
+            for ddx in (-width, 0, width):
+                for ddy in (-width, 0, width):
+                    if ddx or ddy:
+                        img.blit(base, (width + ddx, width + ddy))
+            img.blit(fg, (width, width))
+            self.glyphs[key] = img
+        return img
+
+    def otext(self, font, txt, center, color, width=2, alpha=255, scale=1.0, surf=None):
+        img = self.outlined(font, txt, color, OUTLINE, width)
+        if scale != 1.0:
+            img = pygame.transform.smoothscale_by(img, max(0.01, scale))
+        elif alpha < 255:
+            img = img.copy()
+        if alpha < 255:
+            img.set_alpha(int(max(0, alpha)))
+        (surf or self.screen).blit(img, img.get_rect(center=(int(center[0]), int(center[1]))))
+
+    def wave_text(self, font, txt, cx, cy, color, width=3, amp=5.0, speed=2.4):
+        """A title whose letters bob one after another."""
+        total = font.size(txt)[0]
+        x = cx - total / 2
+        for i, ch in enumerate(txt):
+            w = font.size(txt[:i + 1])[0] - font.size(txt[:i])[0]
+            if ch != " ":
+                y = cy + math.sin(self.t * speed - i * 0.45) * amp
+                self.otext(font, ch, (x + w / 2, y), color, width)
+            x += w
 
     def text(self, txt, font, color, x, y, alpha=255, scale=1.0):
         img = font.render(txt, True, color)
@@ -325,12 +420,11 @@ class Game:
         if scale != 1.0:
             img = pygame.transform.smoothscale_by(img, scale)
             y0 = y - (img.get_height() - h) / 2      # grows around its middle line
-            x0 = x
         else:
-            x0, y0 = x, y
+            y0 = y
         if alpha < 255:
             img.set_alpha(int(alpha))
-        self.screen.blit(img, (x0, y0))
+        self.screen.blit(img, (x, y0))
         return y + h + 4
 
     def center_text(self, txt, font, color, cx, y, surf=None):
@@ -354,15 +448,16 @@ class Game:
             except (pygame.error, AttributeError):
                 pass
 
-    @staticmethod
-    def wrap(txt, width):
+    def wrap(self, txt, font, width):
+        """Split text into lines that fit `width` pixels."""
         lines, cur = [], ""
         for w in txt.split():
-            if cur and len(cur) + len(w) + 1 > width:
+            test = f"{cur} {w}".strip()
+            if cur and font.size(test)[0] > width:
                 lines.append(cur)
                 cur = w
             else:
-                cur = f"{cur} {w}".strip()
+                cur = test
         return lines + [cur]
 
     _panel_cache = {}
@@ -386,20 +481,33 @@ class Game:
         surf = pygame.Surface((rect.w + pad * 2, rect.h + pad * 2), pygame.SRCALPHA)
         for k in range(layers, 0, -1):
             r = pygame.Rect(pad - k * 5, pad - k * 5, rect.w + k * 10, rect.h + k * 10)
-            pygame.draw.rect(surf, (*color, int(strength * 40 / k)), r, border_radius=radius + k * 5)
+            pygame.draw.rect(surf, (*color, int(min(1.0, strength) * 40 / k)), r, border_radius=radius + k * 5)
         self.screen.blit(surf, (rect.x - pad, rect.y - pad))
 
-    def draw_button(self, b, selected, key):
+    def draw_button(self, b, selected, key, ox=0):
         th = self.theme
         a = self.smooth(key, 1.0 if selected and b.enabled else 0.0)
-        r = b.rect.inflate(int(12 * a), int(6 * a))
+        r = b.rect.inflate(int(12 * a), int(6 * a)).move(ox, 0)
+        if key in self.shaking:
+            r.x += int(math.sin(self.shaking[key] * 50) * 7 * self.shaking[key] / 0.45)
         self.glow_rect(r, th.accent, a)
         self.panel(r, 190 + 50 * a)
         pygame.draw.rect(self.screen, lerp_color(th.dim, th.accent, a), r, 1 + round(2 * a),
                          border_radius=14)
         color = lerp_color(th.text if b.enabled else th.dim, th.accent, a)
         img = self.f_mid.render(b.label, True, color)
-        self.screen.blit(img, img.get_rect(center=r.center))
+        if b.sub:
+            sub = self.f_tiny.render(b.sub.upper(), True, lerp_color(th.dim, th.text, a))
+            self.screen.blit(img, img.get_rect(midbottom=(r.centerx, r.centery + 4)))
+            self.screen.blit(sub, sub.get_rect(midtop=(r.centerx, r.centery + 5)))
+        else:
+            self.screen.blit(img, img.get_rect(center=r.center))
+        # a small arrow slides in next to the selected button
+        if a > 0.05:
+            ax = r.x - 8 - 14 * a
+            cy = r.centery
+            pts = [(ax, cy - 8), (ax + 10, cy), (ax, cy + 8)]
+            pygame.draw.polygon(self.screen, lerp_color(th.panel_bg, th.accent, a), pts)
 
     # ------------------------------------------------- modern UI pieces
     def card(self, rect, tint=0.06, alpha=215, radius=14, border=None, surf=None):
@@ -413,7 +521,7 @@ class Game:
         (surf or self.screen).blit(img, rect)
 
     def caps(self, txt, x, y, color, anchor="topleft"):
-        """Small spaced-out capital letters, used for labels."""
+        """Small capital letters, used for labels."""
         img = self.f_tiny.render(txt.upper(), True, color)
         r = img.get_rect(**{anchor: (x, y)})
         self.screen.blit(img, r)
@@ -454,19 +562,18 @@ class Game:
             pts.append((cx + math.cos(a) * r, cy + math.sin(a) * r))
         return pts
 
-    def draw_star(self, cx, cy, r, filled, scale=1.0):
-        th = self.theme
+    def draw_star(self, cx, cy, r, filled, scale=1.0, surf=None):
+        th, s = self.theme, surf or self.screen
         pts = self.star_points(cx, cy, r * scale)
         if filled:
-            pygame.draw.polygon(self.screen, lerp_color(th.accent, (120, 70, 0), 0.45),
-                                [(x, y + 2) for x, y in pts])
-            pygame.draw.polygon(self.screen, th.accent, pts)
+            pygame.draw.polygon(s, lerp_color(th.accent, (120, 70, 0), 0.45), [(x, y + 2) for x, y in pts])
+            pygame.draw.polygon(s, th.accent, pts)
         else:
-            pygame.draw.polygon(self.screen, lerp_color(th.panel_bg, (0, 0, 0), 0.3), pts)
-            pygame.draw.polygon(self.screen, lerp_color(th.dim, th.panel_bg, 0.4), pts, 2)
+            pygame.draw.polygon(s, lerp_color(th.panel_bg, (0, 0, 0), 0.3), pts)
+            pygame.draw.polygon(s, lerp_color(th.dim, th.panel_bg, 0.4), pts, 2)
 
     def draw_icon(self, kind, cx, cy, color):
-        """Tiny vector icons: clock, limit, eye."""
+        """Tiny vector icons: clock (arrivals), limit (strict), eye (hidden)."""
         s = self.screen
         if kind == "clock":
             pygame.draw.circle(s, color, (cx, cy), 7, 2)
@@ -480,10 +587,6 @@ class Game:
             pygame.draw.ellipse(s, color, (cx - 8, cy - 5, 16, 10), 2)
             pygame.draw.circle(s, color, (cx, cy), 2)
             pygame.draw.line(s, color, (cx - 8, cy + 6), (cx + 8, cy - 6), 2)
-
-    def draw_stars(self, cx, y, count, font=None):
-        font = font or self.f_mid
-        self.center_text("★" * count + "☆" * (3 - count), font, self.theme.accent, cx, y)
 
     # ---------------------------------------------------------- main loop
     def run(self):
@@ -503,9 +606,48 @@ class Game:
         pygame.quit()
         sys.exit()
 
-    def go(self, scene):
+    # ------------------------------------------------------ transitions
+    def begin_transition(self, kind="fade", center=None, dur=None):
+        """Remember the current frame; it is drawn over the new one while it
+        fades and zooms out ("fade") or while a circle of the new frame grows
+        through it ("circle")."""
+        img = self.screen.copy()
+        if kind == "circle":
+            img = img.convert_alpha()
+        self.trans = {"img": img, "age": 0.0, "kind": kind,
+                      "center": center or (W // 2, H // 2),
+                      "dur": dur or (0.75 if kind == "circle" else 0.38)}
+
+    def draw_transition(self):
+        tr = self.trans
+        p = tr["age"] / tr["dur"]
+        if p >= 1:
+            self.trans = None
+            return
+        if tr["kind"] == "fade":
+            e = ease_out_cubic(p)
+            img = pygame.transform.smoothscale_by(tr["img"], 1 + 0.05 * e)
+            img.set_alpha(int(255 * (1 - e)))
+            self.screen.blit(img, img.get_rect(center=(W // 2, H // 2)))
+        else:
+            cx, cy = tr["center"]
+            far = max(math.hypot(cx - x, cy - y) for x in (0, W) for y in (0, H))
+            r = int(far * ease_in_out(p)) + 1
+            img = tr["img"].copy()
+            pygame.draw.circle(img, (0, 0, 0, 0), (cx, cy), r)
+            self.screen.blit(img, (0, 0))
+            col = self.theme.accent
+            glow = pygame.Surface((W, H), pygame.SRCALPHA)
+            for k in range(5):
+                pygame.draw.circle(glow, (*col, 60 - k * 11), (cx, cy), r + k * 4, 4)
+            self.screen.blit(glow, (0, 0))
+            pygame.draw.circle(self.screen, col, (cx, cy), r, 3)
+
+    def go(self, scene, transition=True):
+        if transition:
+            self.begin_transition("fade")
         self.scene = scene
-        self.fade = 0.6
+        self.scene_age = 0.0
         self.sel = 0
         if scene == "levels":
             self.sel = self.level_sel
@@ -520,7 +662,13 @@ class Game:
     def update(self, dt):
         self.t += dt
         self.dt = dt
-        self.fade = max(0.0, self.fade - dt * 3)
+        self.scene_age += dt
+        if self.trans:
+            self.trans["age"] += dt
+        for k in list(self.shaking):
+            self.shaking[k] -= dt
+            if self.shaking[k] <= 0:
+                del self.shaking[k]
         self.theme.update(dt, self.t)
         if self.scene == "play":
             self.update_play(dt)
@@ -531,11 +679,8 @@ class Game:
         self.theme.draw_background(self.screen, self.t)
         getattr(self, f"draw_{self.scene}")()
         self.theme.draw_sparks(self.screen)
-        if self.fade > 0:                       # smooth fade after a scene change
-            veil = pygame.Surface((W, H))
-            veil.fill((0, 0, 0))
-            veil.set_alpha(int(255 * ease_in_out(min(1.0, self.fade))))
-            self.screen.blit(veil, (0, 0))
+        if self.trans:
+            self.draw_transition()
 
     # ------------------------------------------------- generic menu input
     def menu_input(self, e, buttons, cols=1, on_locked=None):
@@ -574,14 +719,20 @@ class Game:
     # ---------------------------------------------------------- main menu
     def menu_buttons(self):
         x, w = 560, 320
-        labels = [("Play", lambda: self.start_level(self.first_unfinished())),
-                  ("Choose level", lambda: self.go("levels")),
-                  ("Theme: " + self.theme.title, lambda: self.go("themes")),
-                  ("Quit", self.quit)]
-        return [Button((x, 300 + k * 78, w, 60), lbl, act) for k, (lbl, act) in enumerate(labels)]
+        nxt = self.first_unfinished()
+        best = self.save.get("endless", 0)
+        items = [("Play", lambda: self.start_level(self.first_unfinished()), True,
+                  f"level {nxt + 1}: {LEVELS[nxt].name}"),
+                 ("Level map", lambda: self.go("levels"), True, ""),
+                 ("Endless tide", lambda: self.start_level("endless"), self.endless_unlocked(),
+                  f"best {best}" if self.endless_unlocked() else f"clear level {ENDLESS_UNLOCK + 1} to unlock"),
+                 ("Theme: " + self.theme.title, lambda: self.go("themes"), True, ""),
+                 ("Quit", self.quit, True, "")]
+        return [Button((x, 282 + k * 70, w, 56), lbl, act, ok, sub)
+                for k, (lbl, act, ok, sub) in enumerate(items)]
 
     def menu_demo_reset(self):
-        self.menu_board = Board(make_values(LEVELS[1]), COL_X, 200, BOTTOM)
+        self.menu_board = Board(make_values(LEVELS[1]), None, COL_X, 200, BOTTOM)
         self.menu_steps = bubble_sort_steps(self.menu_board.values())
         self.menu_timer = 0.0
         self.menu_pair = None
@@ -620,31 +771,35 @@ class Game:
             self.quit()
         if e.type == pygame.KEYDOWN and e.key == pygame.K_t:
             self.cycle_theme()
-        self.menu_input(e, self.menu_buttons())
+            return
+        self.menu_input(e, self.menu_buttons(), on_locked=lambda i: self.shaking.__setitem__(f"menu{i}", 0.45))
 
     def draw_menu(self):
         s, th = self.screen, self.theme
         rect = pygame.Rect(COL_X - 110, 140, 220, BOTTOM - 200 + 120)
         th.draw_container(s, rect, self.t)
-        lbl = self.f_small.render(th.up_label, True, th.dim)
-        s.blit(lbl, lbl.get_rect(center=(COL_X, 125)))
+        self.otext(self.f_small, th.up_label, (COL_X, 122), th.dim, 1)
         a = self.smooth("menu_pair_a", 1.0 if self.menu_pair is not None else 0.0, 8)
         if self.menu_pair is not None:
-            self.menu_pair_f = self.smooth("menu_pair_f", self.menu_pair, 10)
+            self.smooth("menu_pair_f", self.menu_pair, 10)
         if a > 0.02:
             self.draw_selector(self.menu_board, self.ui.get("menu_pair_f", 0), th.accent, a)
-        self.menu_board.draw(s, th, self.f_mid, self.t, self.menu_sorted)
+        self.menu_board.draw(s, th, self.f_elem, self.t, self.menu_sorted)
 
-        bob = math.sin(self.t * 1.6) * 5
-        text_outlined(s, self.f_title, th.title, (720, 120 + bob), th.accent, (10, 10, 20), 3)
-        text_outlined(s, self.f_mid, "a game about Bubble Sort", (720, 175), th.text, (10, 10, 20))
-        text_outlined(s, self.f_small, th.tagline, (720, 210), th.dim, (10, 10, 20), 1)
+        e0 = self.ent(0, dur=0.6)
+        self.wave_text(self.f_title, th.title, 720, 105 - 40 * (1 - e0), th.accent, 3)
+        e1 = self.ent(1)
+        self.otext(self.f_mid, "a game about Bubble Sort", (720, 165 + 20 * (1 - e1)), th.text, 2)
+        self.otext(self.f_small, th.tagline, (720, 196 + 20 * (1 - e1)), th.dim, 1)
         total = sum(self.stars(i) for i in range(len(LEVELS)))
-        text_outlined(s, self.f_mid, f"★ {total} / {3 * len(LEVELS)}", (720, 255), th.accent, (10, 10, 20))
+        self.draw_star(672, 240, 11, True)
+        img = self.outlined(self.f_mid, f"{total} / {3 * len(LEVELS)}", th.accent)
+        s.blit(img, img.get_rect(midleft=(690, 240)))
         for i, b in enumerate(self.menu_buttons()):
-            self.draw_button(b, i == self.sel, f"menu{i}")
-        text_outlined(s, self.f_small, "↑↓ choose   ENTER confirm   T theme   ESC quit",
-                      (720, H - 40), th.dim, (10, 10, 20), 1)
+            ox = int(90 * (1 - self.ent(i + 2, step=0.06)))
+            self.draw_button(b, i == self.sel, f"menu{i}", ox)
+        self.otext(self.f_small, "↑↓ choose   ENTER confirm   T theme   ESC quit",
+                   (720, H - 30), th.dim, 1)
 
     # -------------------------------------------------------- level select
     # Levels are nodes on a winding path, like a map in a mobile game:
@@ -675,6 +830,9 @@ class Game:
         if e.type == pygame.KEYDOWN:
             if e.key == pygame.K_ESCAPE:
                 self.go("menu")
+                return
+            if e.key == pygame.K_t:
+                self.cycle_theme()
                 return
             # arrows jump to the nearest node in that direction (works on the winding path)
             d = {pygame.K_LEFT: (-1, 0), pygame.K_RIGHT: (1, 0),
@@ -747,50 +905,58 @@ class Game:
         s, th = self.screen, self.theme
         mouse = pygame.mouse.get_pos()
 
-        # --- header: title + star progress bar
-        text_outlined(s, self.f_big, "Choose a level", (W // 2, 48), th.text, (10, 10, 20), 3)
+        # --- header: title + star progress bar (drops in)
+        hy = -30 * (1 - self.ent(0))
+        self.otext(self.f_big, "Choose a level", (W // 2, 46 + hy), th.text, 3)
         total, most = sum(self.stars(i) for i in range(len(LEVELS))), 3 * len(LEVELS)
-        bar = pygame.Rect(W // 2 - 150, 78, 300, 12)
+        bar = pygame.Rect(W // 2 - 150, 80 + hy, 300, 12)
         pygame.draw.rect(s, lerp_color(th.panel_bg, (0, 0, 0), 0.3), bar, border_radius=6)
         pygame.draw.rect(s, lerp_color(th.dim, th.panel_bg, 0.5), bar.inflate(4, 4), 1, border_radius=8)
-        shown = self.smooth("star_bar", total / most, 5)
+        shown = (total / most) * self.ent(3, dur=0.9)
         if shown > 0.005:
             pygame.draw.rect(s, th.accent, (bar.x, bar.y, max(12, int(bar.w * shown)), bar.h), border_radius=6)
         self.draw_star(bar.right + 18, bar.centery, 10, True)
         img = self.f_mid.render(f"{total}/{most}", True, th.accent)
         s.blit(img, img.get_rect(midleft=(bar.right + 34, bar.centery)))
 
-        # --- the path between nodes (bright where you already went)
+        # --- the path between nodes, drawn out dot by dot as the screen opens
         for i in range(len(LEVELS) - 1):
             done = self.stars(i) > 0
             pts = self.path_points(i)
-            dist = 0.0
+            reveal = clamp01((self.scene_age - 0.1 - i * 0.06) / 0.25)
+            dist, total_len = 0.0, sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))
             for (xa, ya), (xb, yb) in zip(pts, pts[1:]):
-                dist += math.hypot(xb - xa, yb - ya)
-                if int(dist / 13) != int((dist - math.hypot(xb - xa, yb - ya)) / 13):
+                seg = math.hypot(xb - xa, yb - ya)
+                dist += seg
+                if dist > total_len * reveal:
+                    break
+                if int(dist / 13) != int((dist - seg) / 13):
                     if math.hypot(xb - self.node_pos(i)[0], yb - self.node_pos(i)[1]) < self.NODE_R + 6:
                         continue
                     if math.hypot(xb - self.node_pos(i + 1)[0], yb - self.node_pos(i + 1)[1]) < self.NODE_R + 6:
                         continue
                     if done:
-                        pygame.draw.circle(s, th.accent, (int(xb), int(yb)), 4)
+                        # light travels along finished paths
+                        k = 0.5 + 0.5 * math.sin(dist / 30 - self.t * 4)
+                        pygame.draw.circle(s, lerp_color(th.accent, (255, 255, 255), 0.4 * k),
+                                           (int(xb), int(yb)), 3 + round(k))
                     else:
                         pygame.draw.circle(s, lerp_color(th.dim, th.panel_bg, 0.5), (int(xb), int(yb)), 3)
 
-        # --- nodes
+        # --- nodes (pop in one after another along the path)
         current = self.first_unfinished()
         for i, b in enumerate(self.level_buttons()):
+            pop = self.ent(i, step=0.06, dur=0.45, delay=0.08, back=True)
+            if pop <= 0.02:
+                continue
             x, y = self.node_pos(i)
             sel = i == self.sel
             hov = b.rect.collidepoint(mouse)
             a = self.smooth(f"lvl{i}", 1.0 if sel else 0.5 if hov else 0.0)
             if i in self.shaking:                        # locked node wiggles "no"
-                self.shaking[i] -= self.dt
                 x += int(math.sin(self.shaking[i] * 50) * 7 * self.shaking[i] / 0.45)
-                if self.shaking[i] <= 0:
-                    del self.shaking[i]
             y -= int(6 * a)
-            r = int(self.NODE_R * (1 + 0.15 * a))
+            r = max(2, int(self.NODE_R * (1 + 0.15 * a) * pop))
             if sel:                                      # rotating dashed ring around the selection
                 for k in range(12):
                     a0 = self.t * 1.5 + k * math.tau / 12
@@ -804,66 +970,63 @@ class Game:
                     pygame.draw.circle(halo, (*th.accent, int(140 * (1 - k))), (100, 100), int(r + 8 + 30 * k), 3)
                     s.blit(halo, (x - 100, y - 100))
                 # the node is the theme's own element, showing the level number
-                th.draw_element(s, self.f_mid, x, y, r, min(VMAX, i + 1), VMAX, self.t,
+                th.draw_element(s, self.f_elem, x, y, r, min(VMAX, i + 1), VMAX, self.t,
                                 th.accent if self.stars(i) == 3 else None, phase=i)
-                # 3 small stars in an arc under the node
-                for k in range(3):
+                for k in range(3):                       # 3 small stars in an arc under the node
                     sx = x + (k - 1) * 20
                     sy = y + r + 14 + (0 if k == 1 else -4)
-                    self.draw_star(sx, sy, 8, k < self.stars(i))
+                    self.draw_star(sx, sy, 8, k < self.stars(i), pop)
             else:
                 pygame.draw.circle(s, lerp_color(th.panel_bg, (0, 0, 0), 0.35), (x, y), r)
                 pygame.draw.circle(s, lerp_color(th.dim, th.panel_bg, 0.5), (x, y), r, 2)
-                self.draw_lock(x, y + 6)
-            # rule badges in the corner of the node
+                if pop > 0.8:
+                    self.draw_lock(x, y + 6)
+            if pop < 0.9:
+                continue
             lv = LEVELS[i]
-            icons = [k for k, on in (("clock", lv.time_limit), ("limit", lv.swap_limit is not None),
-                                     ("eye", lv.hidden)) if on]
-            for k, icon in enumerate(icons):
+            icons = [k for k, on in (("clock", lv.spawn), ("limit", lv.strict), ("eye", lv.hidden)) if on]
+            for k, icon in enumerate(icons):             # rule badges in the corner of the node
                 bx, by = x + r - 2 + k * 22, y - r + 4
                 pygame.draw.circle(s, th.panel_bg, (bx, by), 11)
                 pygame.draw.circle(s, th.dim, (bx, by), 11, 1)
                 self.draw_icon(icon, bx, by, th.text if b.enabled else th.dim)
             name_col = lerp_color(th.dim, th.text, a) if b.enabled else lerp_color(th.dim, th.panel_bg, 0.3)
-            text_outlined(s, self.f_small, lv.name, (x, y + r + 36), name_col, (10, 10, 20), 1)
+            self.otext(self.f_small, lv.name, (x, y + r + 36), name_col, 1)
 
-        self.draw_level_card()
-        hint = "arrows choose  ·  ENTER play  ·  ESC back"
-        text_outlined(s, self.f_small, hint, (W // 2, H - 16), th.dim, (10, 10, 20), 1)
+        self.draw_level_card(int(170 * (1 - self.ent(4, dur=0.55))))
+        hint = "arrows choose  ·  ENTER play  ·  T theme  ·  ESC back"
+        self.otext(self.f_small, hint, (W // 2, H - 16), th.dim, 1)
 
-    def draw_level_card(self):
+    def draw_level_card(self, oy=0):
         """Details of the selected level with a big PLAY button."""
         s, th = self.screen, self.theme
         lv, i, ok = LEVELS[self.sel], self.sel, self.unlocked(self.sel)
-        box = pygame.Rect(90, 560, W - 180, 120)
+        box = pygame.Rect(90, 560 + oy, W - 180, 120)
         self.glow_rect(box, th.accent, 0.35, 16)
         self.card(box, 0.04, 235, 16, (*th.accent, 90))
-        # big number badge
-        bc = (box.x + 60, box.centery)
+        bc = (box.x + 60, box.centery)                   # big number badge
         pygame.draw.circle(s, th.accent if ok else th.dim, bc, 38)
         pygame.draw.circle(s, lerp_color(th.accent, (255, 255, 255), 0.4) if ok else th.dim, bc, 38, 3)
         img = self.f_big.render(str(i + 1), True, (25, 20, 15))
         s.blit(img, img.get_rect(center=bc))
-        # name, lesson, rule chips
         x = box.x + 120
-        self.caps(f"Level {i + 1}  ·  {lv.n} {th.nouns}", x, box.y + 14, th.accent)
-        self.text(lv.name, self.f_head, th.text, x, box.y + 30)
-        self.text(lv.lesson, self.f_small, th.dim, x, box.y + 66)
-        cx = x
-        chips = []
-        if lv.time_limit:
-            chips.append(f"{lv.time_limit} s clock")
-        if lv.swap_limit is not None:
-            chips.append("exact minimum" if lv.swap_limit == 0 else f"minimum + {lv.swap_limit}")
+        self.caps(f"Level {i + 1}  ·  tank of {lv.capacity}  ·  {lv.start} {th.nouns} to start",
+                  x, box.y + 12, th.accent)
+        self.text(lv.name, self.f_head, th.text, x, box.y + 26)
+        self.text(self.wrap(lv.lesson, self.f_small, 470)[0], self.f_small, th.dim, x, box.y + 64)
+        chips = [f"surface {lv.goal}", f"chain ×{lv.chain}"]
+        chips.append(f"arrival every {lv.spawn:g}s" if lv.spawn else "no arrivals")
+        if lv.strict:
+            chips.append("no wrong swaps")
         if lv.hidden:
             chips.append("hidden numbers")
         best = self.save["best"].get(str(i))
         if best is not None:
-            chips.append(f"best: {best} swaps")
+            chips.append(f"best {best}")
+        cx = x
         for c in chips:
-            cx += self.chip(c, cx, box.y + 90, th.accent) + 8
-        # PLAY button
-        pr = self.play_button_rect()
+            cx += self.chip(c, cx, box.y + 90, th.accent) + 6
+        pr = self.play_button_rect().move(0, oy)          # PLAY button
         hov = pr.collidepoint(pygame.mouse.get_pos())
         a = self.smooth("playbtn", 1.0 if hov else 0.0)
         pr = pr.inflate(int(8 * a), int(6 * a))
@@ -872,7 +1035,6 @@ class Game:
             self.glow_rect(pr, th.accent, 0.6 + 0.4 * pulse * (1 - a) + a, 30)
             pygame.draw.rect(s, lerp_color(th.accent, (120, 70, 0), 0.4), pr.move(0, 4), border_radius=30)
             pygame.draw.rect(s, lerp_color(th.accent, (255, 255, 255), 0.25 * a), pr, border_radius=30)
-            # play triangle + text
             tx, ty = pr.x + 34, pr.centery
             pygame.draw.polygon(s, (25, 20, 15), [(tx - 7, ty - 10), (tx - 7, ty + 10), (tx + 10, ty)])
             img = self.f_mid.render("PLAY", True, (25, 20, 15))
@@ -898,13 +1060,15 @@ class Game:
                 for k, th in enumerate(self.themes)]
 
     def pick_theme(self, k):
+        center = self.theme_buttons()[k].rect.center
+        self.begin_transition("circle", center)
         self.theme_idx = k
         self.apply_theme()
         write_save(self.save)
-        self.go("menu")
+        self.go("menu", transition=False)
 
-    def cycle_theme(self):
-        self.fade = 0.5
+    def cycle_theme(self, center=None):
+        self.begin_transition("circle", center)
         self.theme_idx = (self.theme_idx + 1) % len(self.themes)
         self.apply_theme()
         write_save(self.save)
@@ -917,11 +1081,12 @@ class Game:
 
     def draw_themes(self):
         s = self.screen
-        text_outlined(s, self.f_big, "Choose a theme", (W // 2, 80), self.theme.accent, (10, 10, 20), 3)
+        self.otext(self.f_big, "Choose a theme", (W // 2, 80 - 30 * (1 - self.ent(0))), self.theme.accent, 3)
         for k, b in enumerate(self.theme_buttons()):
             th, sel = self.themes[k], k == self.sel
+            fs = self.fontsets[th.key]
             a = self.smooth(f"theme{k}", 1.0 if sel else 0.0)
-            b.rect = b.rect.move(0, int(-10 * a))
+            b.rect = b.rect.move(0, int(-10 * a + 140 * (1 - self.ent(k + 1, step=0.08))))
             self.glow_rect(b.rect, th.accent, a, 6)
             # each card is a little window into its own theme
             card = pygame.Surface(b.rect.size)
@@ -929,108 +1094,209 @@ class Game:
             s.blit(card, b.rect)
             for v, yy in ((4, 300), (8, 230)):
                 fy = math.sin(self.t * 2 + v) * 6 * (0.3 + a)
-                th.draw_element(s, self.f_mid, b.rect.centerx, b.rect.y + yy + fy,
+                th.draw_element(s, fs["elem"], b.rect.centerx, b.rect.y + yy + fy,
                                 int((14 + v * 3) * (1 + 0.1 * a)), v, VMAX, self.t,
                                 th.accent if v == 8 else None, phase=v)
             pygame.draw.rect(s, lerp_color(th.dim, th.accent, a), b.rect, 1 + round(3 * a), border_radius=6)
-            text_outlined(s, self.f_mid, th.title, (b.rect.centerx, b.rect.y + 30), th.accent, (10, 10, 20))
-            for n, line in enumerate(self.wrap(th.tagline, 28)):
-                text_outlined(s, self.f_small, line, (b.rect.centerx, b.rect.y + 62 + n * 20),
-                              th.text, (10, 10, 20), 1)
+            # the title is written in the theme's own font
+            self.otext(fs["head"], th.title, (b.rect.centerx, b.rect.y + 34), th.accent, 2)
+            for n, line in enumerate(self.wrap(th.tagline, fs["small"], b.rect.w - 30)):
+                self.otext(fs["small"], line, (b.rect.centerx, b.rect.y + 72 + n * 20), th.text, 1)
             if k == self.theme_idx:
-                text_outlined(s, self.f_small, "current", (b.rect.centerx, b.rect.bottom - 20),
-                              th.accent, (10, 10, 20), 1)
-        text_outlined(s, self.f_small, "←→ choose   ENTER apply   ESC back",
-                      (W // 2, H - 40), self.theme.dim, (10, 10, 20), 1)
+                self.otext(fs["small"], "current", (b.rect.centerx, b.rect.bottom - 20), th.accent, 1)
+        self.otext(self.f_small, "←→ choose   ENTER apply   ESC back", (W // 2, H - 40), self.theme.dim, 1)
 
     # ------------------------------------------------------------- playing
     def start_level(self, idx):
-        if not self.unlocked(idx):
-            return
-        self.level_idx = self.level_sel = idx
-        self.level = LEVELS[idx]
+        if idx == "endless":
+            if not self.endless_unlocked():
+                return
+            self.level_idx, self.level = -1, ENDLESS
+        else:
+            if not self.unlocked(idx):
+                return
+            self.level_idx = self.level_sel = idx
+            self.level = LEVELS[idx]
         self.start_values = make_values(self.level)
-        self.scene = "play"
-        self.fade = 0.6
+        self.seed = random.randrange(1 << 30)
+        self.go("play")
         self.reset()
 
+    @property
+    def endless(self):
+        return self.level.goal is None
+
     def reset(self):
-        self.board = Board(self.start_values)
+        lv = self.level
+        self.board = Board(self.start_values, lv.capacity)
+        self.feed = Feed(lv, random.Random(self.seed))   # the same arrivals after a restart
+        self.queue = []
+        for _ in range(3):
+            self.queue.append(self.feed.next(self.start_values + self.queue))
+        self.spawn_every = lv.spawn
+        self.spawn_t = (lv.spawn + 2.0) if lv.spawn else None   # a little extra time to look first
         self.cursor = 0
         self.swaps = 0
-        self.opt_comps, self.opt_swaps = count_stats(self.start_values)
-        self.limit = None if self.level.swap_limit is None else self.opt_swaps + self.level.swap_limit
-        self.time_left = self.level.time_limit
+        self.wrong = 0
+        self.surfaced = 0
+        self.score = 0
+        self.shown_score = 0.0
+        self.chain = 0
+        self.chain_t = 0.0
+        self.best_chain = 0
+        self.ready_t = 0.0
         self.result = None            # None | "won" | "failed" | "demo"
         self.fail_reason = ""
         self.new_record = False
+        self.earned = 0
         self.demo = None
         self.demo_step = None
         self.demo_timer = 0.0
         self.demo_paused = False
         self.demo_swapped = False
-        self.sorted_from = self.board.n
+        self.demo_finale = False
+        self.demo_sorted = None
         self.shake = 0.0
         # animation state of the play screen
-        self.cur_f = 0.0               # smoothed pointer position (pair index)
+        self.rising = []              # elements on their way out of the tank
+        self.rings = []               # shock-wave rings where they popped
+        self.popups = []              # floating "+120" texts
+        self.banner = None            # ["CHAIN x3", age]
+        self.code_flash = None        # [line, colour, age]
+        self.cur_f = 0.0              # smoothed pointer position (pair index)
         self.sel_color = self.theme.accent
-        self.hover_pair = None         # pair under the mouse
-        self.hover_shown = 0           # last hovered pair, kept while it fades out
+        self.hover_pair = None        # pair under the mouse
+        self.hover_shown = 0          # last hovered pair, kept while it fades out
         self.hover_a = 0.0
-        self.swap_pop = 0.0            # "Swaps: N" bounces when it changes
+        self.swap_pop = 0.0           # tiles bounce when they change
+        self.score_pop = 0.0
         self.msg_age = 0.0
         self.shown_msg = ""
-        self.hl_y = None               # smoothed pseudocode highlight
+        self.hl_y = None              # smoothed pseudocode highlight
         self.result_age = 0.0
+        self.ring_from = self.board.n
         th = self.theme
-        self.msg_kind = "info"
-        self.message = f"Swap neighbouring {th.nouns}. Big ones must reach the top!"
+        if lv.spawn:
+            self.message = f"Bring the biggest {th.noun} to the top. Newcomers arrive from below!"
+        else:
+            self.message = f"The biggest {th.noun} on top surfaces. Empty the tank!"
         self.msg_kind = "info"
 
-    def player_swap(self):
-        if self.result or self.demo:
+    # --- the rules
+    def surface_ready(self):
+        b = self.board
+        if b.n == 0 or b.busy or not b.settled(b.n - 1):
+            return False
+        return b.items[-1].value >= max(b.values())
+
+    def surface(self):
+        """The top element is the biggest: it leaves the tank."""
+        b, th = self.board, self.theme
+        e = b.items.pop()
+        x, y = b.x_of(e, self.t), e.y
+        self.rising.append({"e": e, "x": x, "y0": y, "age": 0.0, "r": b.radius(e.value)})
+        self.ready_t = 0.0
+        self.cursor = max(0, min(self.cursor, b.n - 2))
+        if self.demo_finale:
+            if b.n == 0:
+                self.result, self.result_age = "demo", -0.4
             return
-        b, j = self.board, self.cursor
+        self.chain += 1
+        self.chain_t = 1.1
+        self.best_chain = max(self.best_chain, self.chain)
+        pts = 10 * e.value * self.chain
+        self.score += pts
+        self.score_pop = 1.0
+        self.surfaced += 1
+        txt = f"+{pts}" if self.chain < 2 else f"+{pts}  ×{self.chain}"
+        self.popups.append({"txt": txt, "x": x + 70, "y": SURFACE_Y + 20, "age": 0.0, "col": th.accent})
+        if self.chain >= 2:
+            self.banner = [f"CHAIN ×{self.chain}", 0.0]
+            self.message = (f"Chain ×{self.chain}! The top was already sorted, "
+                            "so it surfaces in one go.")
+            self.msg_kind = "good"
+        elif not self.result:
+            self.message = f"{th.noun.capitalize()} {e.value} was the biggest: it surfaced!"
+            self.msg_kind = "good"
+        if self.level.goal and self.surfaced >= self.level.goal and not self.result:
+            self.win()
+        elif b.n == 0 and not self.level.spawn and not self.result:
+            self.win()
+
+    def arrive(self, early=False):
+        """The next element enters at the bottom of the tank."""
+        b, th = self.board, self.theme
+        if b.n >= b.cap:
+            self.fail("The tank overflowed!")
+            return
+        v = self.queue.pop(0)
+        self.queue.append(self.feed.next(b.values() + self.queue + [v]))
+        b.arrive(v)
+        if b.n > 2:
+            self.cursor = min(self.cursor + 1, b.n - 2)
+        self.spawn_every = max(self.level.min_spawn, self.spawn_every * self.level.speedup)
+        if early:
+            bonus = int(self.spawn_t * 4) + 5
+            self.score += bonus
+            self.score_pop = 1.0
+            self.popups.append({"txt": f"+{bonus} early", "x": 90, "y": BOTTOM - 40, "age": 0.0,
+                                "col": th.good})
+        self.spawn_t = self.spawn_every
+        th.burst(COL_X, b.bottom + 20, 10)
+        if b.n == b.cap:
+            self.message = "The tank is full! Surface something before the next one arrives."
+            self.msg_kind = "bad"
+
+    def call_next(self):
+        if self.level.spawn and not self.result and not self.demo and not self.demo_finale:
+            self.arrive(early=True)
+
+    def player_swap(self):
+        b = self.board
+        if self.result or self.demo or self.demo_finale or b.n < 2:
+            return
+        j = self.cursor
         a, c = b.items[j].value, b.items[j + 1].value
         b.swap(j)
         self.swaps += 1
         self.swap_pop = 1.0
+        self.ready_t = 0.0
         th = self.theme
         y = (b.slot_y(j) + b.slot_y(j + 1)) / 2
         if a > c:
-            self.message = f"Nice! {a} > {c}, so {a} {th.rise_verb}."
+            self.message = f"{a} > {c}: swap! {a} {th.rise_verb}."
+            if self.level.hidden:
+                self.message = f"Good swap: the bigger one {th.rise_verb}."
             self.msg_kind = "good"
+            self.code_flash = [4, th.good, 0.0]
             th.burst(COL_X, y)
-        elif a == c:
-            self.msg_kind = "bad"
-            self.message = (f"{a} = {c}: Bubble Sort never swaps equal values. "
-                            "That is what makes it stable!")
-            self.shake = 0.3
+            return
+        self.wrong += 1
+        self.shake = 0.35
+        self.code_flash = [3, th.bad, 0.0]
+        if a == c:
+            self.message = f"{a} = {c}: Bubble Sort never swaps equal values. That keeps it stable!"
+        elif self.level.hidden:
+            self.message = "Wrong swap: the smaller one went up."
         else:
-            self.message = f"Hmm, {a} < {c}: that swap breaks the order!"
-            self.msg_kind = "bad"
-            self.shake = 0.4
-        if self.level.hidden:
-            self.message = "Swapped. " + ("Bigger one went up, good!" if a > c else "Careful, that made it worse!")
-        if b.is_sorted():
-            self.win()
-        elif self.limit is not None and self.swaps >= self.limit:
-            self.fail("No swaps left! Every wasted swap counts.")
+            self.message = f"{a} < {c}: that swap breaks the order!"
+        self.msg_kind = "bad"
+        if self.level.strict:
+            self.fail("A wrong swap cracked the tank!")
 
     def win(self):
         self.result = "won"
-        self.sorted_from = 0
-        extra = self.swaps - self.opt_swaps
-        self.earned = 3 if extra == 0 else 2 if extra <= max(2, self.board.n // 3) else 1
+        self.result_age = -0.5              # let the last element surface first
+        lv = self.level
+        self.earned = 1 + (self.best_chain >= lv.chain) + (self.wrong == 0)
         key = str(self.level_idx)
         if self.earned > self.stars(self.level_idx):
             self.save["stars"][key] = self.earned
         best = self.save["best"].get(key)
-        if best is None or self.swaps < best:
-            self.save["best"][key] = self.swaps
+        if best is None or self.score > best:
+            self.save["best"][key] = self.score
             self.new_record = best is not None
         write_save(self.save)
-        self.result_age = 0.0
         self.board.pop_wave()
         for i in range(self.board.n):
             self.theme.burst(COL_X, self.board.slot_y(i), 10)
@@ -1039,15 +1305,24 @@ class Game:
         self.result = "failed"
         self.result_age = 0.0
         self.fail_reason = reason
-        self.shake = 0.5
+        self.shake = 0.6
+        if self.endless:
+            best = self.save.get("endless", 0)
+            self.new_record = self.score > best
+            if self.new_record:
+                self.save["endless"] = self.score
+                write_save(self.save)
+        for e in self.board.items:
+            self.theme.burst(COL_X, e.y, 4)
 
+    # --- demo
     def toggle_demo(self):
-        was = self.demo
+        was = self.demo or self.demo_finale
         self.reset()
         if was:
             return
         self.demo = bubble_sort_steps(self.start_values)
-        self.time_left = None
+        self.spawn_t = None
         self.message = "DEMO: watch how the algorithm does it."
         self.msg_kind = "info"
 
@@ -1074,27 +1349,33 @@ class Game:
             self.message = f"{v[j]} ≤ {v[j + 1]} → leave them, the order is fine{same}."
             self.msg_kind = "good"
         elif kind == "pass_end":
-            self.sorted_from = j
+            self.demo_sorted = j
             b.items[j].pop = 1.0
             self.message = f"End of pass {i + 1}: {self.theme.noun} {v[j]} is now in its final place."
             self.msg_kind = "good"
         elif kind == "early":
-            self.sorted_from = 0
+            self.demo_sorted = 0
             self.message = "A whole pass with no swaps → everything is sorted, stop early!"
             self.msg_kind = "good"
         elif kind == "done":
-            self.sorted_from = 0
-            self.result = "demo"
-            self.result_age = 0.0
-            b.pop_wave()
             self.demo = None
+            self.demo_finale = True
+            self.message = "Sorted! Now the whole tank surfaces in one chain."
+            self.msg_kind = "good"
+
+    # --- input
+    def next_rect(self):
+        return pygame.Rect(18, BOTTOM - 196, 100, 262)
 
     def handle_play(self, e):
         if e.type == pygame.KEYDOWN:
             self.on_key(e.key)
-        elif e.type == pygame.MOUSEWHEEL and not self.demo and not self.result:
+        elif e.type == pygame.MOUSEWHEEL and not self.demo and not self.result and self.board.n >= 2:
             self.cursor = max(0, min(self.board.n - 2, self.cursor + e.y))
         elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1 and not self.demo and not self.result:
+            if self.level.spawn and self.next_rect().collidepoint(e.pos):
+                self.call_next()
+                return
             j = self.board.pair_at(e.pos)
             if j is None:
                 return
@@ -1106,19 +1387,20 @@ class Game:
     def on_key(self, k):
         n = self.board.n
         if k == pygame.K_ESCAPE:
-            self.go("levels")
+            self.go("menu" if self.endless else "levels")
         elif k == pygame.K_t:
-            self.cycle_theme()
+            self.cycle_theme((COL_X, H // 2))
         elif k == pygame.K_r:
+            self.begin_transition("fade", dur=0.25)
             self.reset()
         elif k == pygame.K_d:
             self.toggle_demo()
-        elif k == pygame.K_n:
+        elif k == pygame.K_n and not self.endless:
             nxt = self.level_idx + 1
             if nxt < len(LEVELS) and self.unlocked(nxt):
                 self.start_level(nxt)
             elif nxt >= len(LEVELS):
-                self.message = "That was the last level. You are a Bubble Sort master!"
+                self.message = "That was the last level. Try the Endless tide!"
             else:
                 self.message = "Solve this level first to unlock the next one."
         elif k in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
@@ -1130,7 +1412,11 @@ class Game:
                 self.demo_paused = not self.demo_paused
             elif k == pygame.K_RIGHT and self.demo_paused:
                 self.demo_advance()
-        elif self.result:
+        elif self.result or self.demo_finale:
+            return
+        elif k == pygame.K_f:
+            self.call_next()
+        elif n < 2:
             return
         elif k == pygame.K_UP:
             self.cursor = min(self.cursor + 1, n - 2)
@@ -1139,12 +1425,15 @@ class Game:
         elif k == pygame.K_SPACE:
             self.player_swap()
 
+    # --- update
     def update_play(self, dt):
-        b = self.board
+        b, th = self.board, self.theme
         # which pair is under the mouse?
-        interactive = not self.demo and not self.result and pygame.mouse.get_focused()
+        interactive = (not self.demo and not self.result and not self.demo_finale
+                       and pygame.mouse.get_focused())
         self.hover_pair = b.pair_at(pygame.mouse.get_pos()) if interactive else None
-        self.set_hand(self.hover_pair is not None)
+        over_next = interactive and self.level.spawn and self.next_rect().collidepoint(pygame.mouse.get_pos())
+        self.set_hand(self.hover_pair is not None or bool(over_next))
         if self.hover_pair is not None and self.hover_pair != self.cursor:
             self.hover_shown = self.hover_pair
         show = self.hover_pair is not None and self.hover_pair != self.cursor
@@ -1152,30 +1441,75 @@ class Game:
         for i, e in enumerate(b.items):
             e.hover = show and i in (self.hover_pair, self.hover_pair + 1)
         # smooth pointer movement and colour
+        self.cursor = max(0, min(self.cursor, b.n - 2))
         self.cur_f = approach(self.cur_f, self.cursor, dt, 16)
         step = self.demo_step[0] if (self.demo and self.demo_step) else None
-        th = self.theme
         target = {"swap": th.bad, "keep": th.good}.get(step, th.accent)
         if self.shake > 0 and not self.demo:
             target = th.bad
         self.sel_color = tuple(approach(c, tc, dt, 12) for c, tc in zip(self.sel_color, target))
         self.swap_pop = max(0.0, self.swap_pop - dt * 3)
+        self.score_pop = max(0.0, self.score_pop - dt * 2.5)
+        self.shown_score = approach(self.shown_score, self.score, dt, 8)
         self.msg_age += dt
         self.result_age += dt
-
-        b.update(dt)
         self.shake = max(0.0, self.shake - dt)
-        if self.time_left is not None and not self.result and not self.demo:
-            self.time_left -= dt
-            if self.time_left <= 0:
-                self.time_left = 0
-                self.fail("Time is up!")
+        b.update(dt)
+
+        # which elements would surface in one chain? (gold rings)
+        self.ring_from = self.demo_sorted if self.demo_sorted is not None and not self.demo_finale \
+            else chain_start(b.values())
+
+        # surfacing: the top element leaves when it is the biggest
+        playing = not self.result and not self.demo
+        if playing or self.demo_finale:
+            if self.surface_ready():
+                self.ready_t += dt
+                if self.ready_t >= (0.22 if self.chain_t > 0 or self.demo_finale else 0.4):
+                    self.surface()
+            else:
+                self.ready_t = 0.0
+        if self.chain_t > 0:
+            self.chain_t -= dt
+            if self.chain_t <= 0:
+                self.chain = 0
+
+        # arrivals
+        if playing and self.spawn_t is not None and not self.demo_finale:
+            self.spawn_t -= dt
+            if self.spawn_t <= 0:
+                self.arrive()
+
         if self.demo and not self.demo_paused:
             self.demo_timer += dt
             if self.demo_timer >= self.demo_delay:
                 self.demo_timer = 0
                 self.demo_advance()
 
+        # effects
+        for r in self.rising:
+            r["age"] += dt
+            if r["age"] >= 0.42 and not r.get("popped"):
+                r["popped"] = True
+                th.burst(r["x"], SURFACE_Y, 18)
+                self.rings.append([r["x"], SURFACE_Y, 0.0])
+        self.rising = [r for r in self.rising if not r.get("popped")]
+        for ring in self.rings:
+            ring[2] += dt
+        self.rings = [r for r in self.rings if r[2] < 0.5]
+        for p in self.popups:
+            p["age"] += dt
+        self.popups = [p for p in self.popups if p["age"] < 1.1]
+        if self.banner:
+            self.banner[1] += dt
+            if self.banner[1] > 1.3:
+                self.banner = None
+        if self.code_flash:
+            self.code_flash[2] += dt
+            if self.code_flash[2] > 0.9:
+                self.code_flash = None
+
+    # --- drawing
     def pair_rect(self, board, jf, dx=0, grow=0):
         """Rounded box around pair jf (float, so it can glide between pairs)."""
         y1, y2 = board.slot_y(jf), board.slot_y(jf + 1)
@@ -1190,20 +1524,17 @@ class Game:
         self.glow_rect(box, color, alpha * (0.7 + 0.5 * breathe), 30, 5)
         fill = pygame.Surface(box.size, pygame.SRCALPHA)
         pygame.draw.rect(fill, (*color, int(alpha * (30 + 25 * breathe))), fill.get_rect(), border_radius=30)
-        # a soft shine line along the top of the capsule
         pygame.draw.rect(fill, (255, 255, 255, int(alpha * 40)), (18, 6, box.w - 36, 4), border_radius=2)
         s.blit(fill, box)
         edge = pygame.Surface(box.size, pygame.SRCALPHA)
         pygame.draw.rect(edge, (*color, int(255 * alpha)), edge.get_rect(), 3, border_radius=30)
         s.blit(edge, box)
-        # chevrons on both sides, bobbing towards the pair
-        cy, bob = box.centery, 5 * math.sin(t * 6)
+        cy, bob = box.centery, 5 * math.sin(t * 6)          # chevrons bobbing towards the pair
         for side in (-1, 1):
             x = box.centerx + side * (box.w / 2 + 18 + bob)
             pts = [(x + side * 9, cy - 11), (x - side * 5, cy), (x + side * 9, cy + 11)]
             pygame.draw.polygon(s, lerp_color((20, 20, 30), color, alpha), pts)
-        # little swap icon: two arrows, one up, one down
-        ix = box.right + 44 + dx
+        ix = box.right + 44 + dx                              # little swap icon
         for k, d in ((-1, -1), (1, 1)):
             ax = ix + k * 6
             ay = cy - d * 9 + d * 2 * math.sin(t * 6)
@@ -1214,9 +1545,11 @@ class Game:
         """The pair under the mouse: soft halos and thin rings around its two
         elements only, so it never covers the selected (gold) capsule."""
         th = self.theme
+        if j >= board.n - 1:
+            return
         for i in (j, j + 1):
             if i == self.cursor or i == self.cursor + 1:
-                continue                         # already inside the gold capsule
+                continue
             e = board.items[i]
             x, y = board.x_of(e, t) + dx, e.y
             r = int(board.radius(e.value) * e.scale) + 8
@@ -1226,9 +1559,7 @@ class Game:
                 pygame.draw.circle(halo, (*th.text, int(alpha * 14 * (k + 1))), (c, c), r + 10 - k * 3)
             pygame.draw.circle(halo, (*th.text, int(alpha * 200)), (c, c), r, 2)
             self.screen.blit(halo, (x - c, y - c))
-        # a small tag at the left, pointing at the middle of the pair
-        y1, y2 = board.slot_y(j), board.slot_y(j + 1)
-        cy = (y1 + y2) / 2
+        cy = (board.slot_y(j) + board.slot_y(j + 1)) / 2
         img = self.f_tiny.render("SELECT", True, th.text)
         tag = pygame.Rect(0, 0, img.get_width() + 16, img.get_height() + 8)
         tag.midright = (board.col_x - 116 + dx, cy)
@@ -1238,19 +1569,83 @@ class Game:
         img.set_alpha(int(255 * alpha))
         surf.blit(img, img.get_rect(center=surf.get_rect().center))
         self.screen.blit(surf, tag)
-        if alpha > 0.5:                          # small arrow pointing at the pair
+        if alpha > 0.5:
             pygame.draw.polygon(self.screen, th.text,
                                 [(tag.right + 3, cy - 5), (tag.right + 9, cy), (tag.right + 3, cy + 5)])
+
+    def draw_tank_marks(self, rect, dx):
+        """Slot lights on the side of the tank and the surface line on top."""
+        s, th, b = self.screen, self.theme, self.board
+        full = b.n >= b.cap and not self.result
+        danger = full and self.spawn_t is not None and not self.demo
+        pulse = 0.5 + 0.5 * math.sin(self.t * 10)
+        if danger:
+            self.glow_rect(rect, th.bad, 0.6 + 0.6 * pulse, 14, 5)
+        for i in range(b.cap):
+            y = int(b.slot_y(i))
+            on = i < b.n
+            col = (th.bad if danger else th.accent) if on else lerp_color(th.dim, th.panel_bg, 0.55)
+            k = self.smooth(f"slot{i}", 1.0 if on else 0.0, 10)
+            r = 3 + round(2 * k)
+            pygame.draw.circle(s, lerp_color(th.panel_bg, col, 0.4 + 0.6 * k), (rect.x + 14, y), r)
+        # surface line: dashed, slowly flowing
+        y = SURFACE_Y + 18
+        off = (self.t * 30) % 16
+        x = rect.x + 10 - off
+        while x < rect.right - 10:
+            x0, x1 = max(rect.x + 10, x), min(rect.right - 10, x + 8)
+            if x1 > x0:
+                pygame.draw.line(s, lerp_color(th.dim, th.accent, 0.3), (x0, y), (x1, y), 2)
+            x += 16
+
+    def draw_next(self):
+        """The queue of arriving elements, with a timer ring around the first one."""
+        s, th, b = self.screen, self.theme, self.board
+        r0 = self.next_rect()
+        e_in = self.ent(2, dur=0.5)
+        r0 = r0.move(int(-140 * (1 - e_in)), 0)
+        hov = r0.collidepoint(pygame.mouse.get_pos()) and not self.result and not self.demo
+        a = self.smooth("nexthov", 1.0 if hov else 0.0)
+        full = b.n >= b.cap and not self.result
+        border = th.bad if full else lerp_color(th.dim, th.accent, a)
+        self.glow_rect(r0, border, 0.3 + 0.5 * a, 16)
+        self.card(r0, 0.04, 210, 16, (*border, 160))
+        self.caps("next", r0.centerx, r0.y + 10, th.accent, "midtop")
+        frac = 0.0 if self.spawn_t is None else 1 - self.spawn_t / max(0.1, self.spawn_every)
+        frac = clamp01(frac)
+        ys = (r0.bottom - 58, r0.bottom - 128, r0.bottom - 186)
+        for k in range(2, -1, -1):
+            v = self.queue[k]
+            rr = int(b.radius(v) * (0.7 if k == 0 else 0.55))
+            y = ys[k]
+            if k == 0 and frac > 0.8 and not self.result and self.spawn_t is not None:
+                y += math.sin(self.t * 40) * 2 * (frac - 0.8) * 5         # jitters before it drops in
+            th.draw_element(s, self.f_elem if k == 0 else self.f_small, r0.centerx, y, rr, v, VMAX,
+                            self.t, None, "", k, self.level.hidden)
+        # timer ring around the first one
+        cx, cy, R = r0.centerx, ys[0], 34
+        pygame.draw.circle(s, lerp_color(th.panel_bg, (0, 0, 0), 0.3), (cx, cy), R, 4)
+        if frac > 0:
+            col = th.bad if full or frac > 0.8 else th.accent
+            pygame.draw.arc(s, col, (cx - R, cy - R, 2 * R, 2 * R),
+                            math.pi / 2 - math.tau * frac, math.pi / 2, 4)
+        # "F early" hint
+        kx = r0.centerx - 34
+        kw = self.keycap("F", kx, r0.bottom - 26)
+        img = self.f_tiny.render("NOW +", True, th.dim)
+        s.blit(img, (kx + kw + 6, r0.bottom - 22))
 
     def draw_play(self):
         s, th = self.screen, self.theme
         dx = int(math.sin(self.t * 60) * 8 * self.shake)
-        rect = pygame.Rect(COL_X - 110 + dx, TOP - 60, 220, BOTTOM - TOP + 120)
+        rect = pygame.Rect(COL_X - 110 + dx, TOP - 80, 220, BOTTOM - TOP + 140)
         th.draw_container(s, rect, self.t)
-        text_outlined(s, self.f_small, th.up_label, (COL_X, TOP - 75), th.dim, (10, 10, 20), 1)
+        self.otext(self.f_small, th.up_label, (COL_X, TOP - 95), th.dim, 1)
+        self.draw_tank_marks(rect, dx)
 
         step = self.demo_step[0] if (self.demo and self.demo_step) else None
-        show_sel = not self.result and (not self.demo or step in ("compare", "swap", "keep"))
+        show_sel = (not self.result and not self.demo_finale and self.board.n >= 2
+                    and (not self.demo or step in ("compare", "swap", "keep")))
         sel_a = self.smooth("sel_a", 1.0 if show_sel else 0.0, 10)
         if sel_a > 0.02:
             self.draw_selector(self.board, self.cur_f, self.sel_color, sel_a, dx)
@@ -1265,94 +1660,147 @@ class Game:
                 s.blit(img, img.get_rect(center=tag.center))
         if self.hover_a > 0.02:
             self.draw_hover(self.board, self.hover_shown, self.hover_a, self.t, dx)
-        self.board.draw(s, th, self.f_mid, self.t, self.sorted_from,
-                        self.level.hidden and self.result is None, dx)
+        # the top element glows while it is about to surface
+        b = self.board
+        if b.n and self.ready_t > 0:
+            e = b.items[-1]
+            k = clamp01(self.ready_t / 0.4)
+            R = int(b.radius(e.value) * 1.6)
+            halo = pygame.Surface((R * 2, R * 2), pygame.SRCALPHA)
+            pygame.draw.circle(halo, (*th.accent, int(90 * k)), (R, R), R)
+            s.blit(halo, (b.x_of(e, self.t) + dx - R, e.y - R))
+        b.draw(s, th, self.f_elem, self.t, self.ring_from,
+               self.level.hidden and self.result is None, dx, labels=self.level.feed == "dupes")
+        for r in self.rising:                      # elements on their way out
+            p = clamp01(r["age"] / 0.42)
+            y = r["y0"] + (SURFACE_Y - r["y0"]) * ease_in_out(p)
+            rr = int(r["r"] * (1 + 0.25 * p))
+            e = r["e"]
+            th.draw_element(s, self.f_elem, r["x"] + dx, y, rr, e.value, VMAX, self.t,
+                            th.accent, "", e.phase, self.level.hidden and not self.result)
+        for x, y, age in self.rings:               # pop shock waves
+            k = age / 0.5
+            surf = pygame.Surface((200, 200), pygame.SRCALPHA)
+            pygame.draw.circle(surf, (*th.accent, int(220 * (1 - k))), (100, 100), int(20 + 70 * ease_out_cubic(k)), 3)
+            s.blit(surf, (x - 100, y - 100))
+        for p in self.popups:                      # floating score texts
+            k = p["age"] / 1.1
+            self.otext(self.f_mid, p["txt"], (p["x"], p["y"] - 46 * ease_out_cubic(k)), p["col"], 2,
+                       255 * (1 - k ** 3))
+        if self.banner:                            # CHAIN xN
+            txt, age = self.banner
+            sc = ease_out_back(clamp01(age / 0.3))
+            alpha = 255 * clamp01((1.3 - age) / 0.35)
+            self.otext(self.f_big, txt, (COL_X, TOP + 30), th.accent, 3, alpha, max(0.05, sc))
+        if self.level.spawn:
+            self.draw_next()
         self.draw_panel()
         if self.result:
             self.draw_result()
 
     def draw_panel(self):
-        """Right side: header, stat tiles, message, pseudocode card, controls."""
+        """Right side: header, stat tiles, goals, message, pseudocode, controls."""
         s, th, lv = self.screen, self.theme, self.level
-        px, pw = PANEL_X, W - PANEL_X - 20
+        e_in = self.ent(0, dur=0.55)
+        ox = int(340 * (1 - e_in))
+        px, pw = PANEL_X + ox, W - PANEL_X - 20
         self.panel(pygame.Rect(px, 20, pw, H - 40), 200)
         x, inner = px + 20, pw - 40
 
         # --- header
-        self.caps(f"Level {self.level_idx + 1}  ·  {self.board.n} {th.nouns}", x, 34, th.accent)
-        if self.demo or self.result == "demo":
+        head = "Endless tide" if self.endless else f"Level {self.level_idx + 1}"
+        self.caps(f"{head}  ·  tank of {lv.capacity}", x, 34, th.accent)
+        if self.demo or self.demo_finale or self.result == "demo":
             label = "demo paused" if self.demo_paused else f"demo · {self.demo_delay:.1f}s"
             img = self.f_tiny.render(label.upper(), True, th.text)
             self.chip(label, x + inner - img.get_width() - 18, 30, th.accent, filled=True)
         self.text(lv.name, self.f_head, th.text, x, 50)
-        y = 86
-        for line in self.wrap(lv.lesson, 54):
+        y = 90
+        for line in self.wrap(lv.lesson, self.f_small, inner)[:2]:
             y = self.text(line, self.f_small, th.dim, x, y) - 2
+        off = max(0, y + 6 - 132)
 
-        # --- stat tiles
-        best = self.save["best"].get(str(self.level_idx))
-        tiles = [("swaps", str(self.swaps),
-                  f"limit {self.limit}" if self.limit is not None and not self.demo else None),
-                 ("minimum", str(self.opt_swaps), None),
-                 ("compares", str(self.opt_comps), None)]
-        if self.time_left is not None:
-            tiles.append(("time", f"{math.ceil(self.time_left)}s", None))
-        else:
-            tiles.append(("best", "-" if best is None else str(best), None))
-        off = max(0, y + 6 - 132)              # a 2-line lesson pushes everything down a bit
+        # --- stat tiles (stagger in)
+        goal_txt = f"{self.surfaced}/{lv.goal}" if lv.goal else str(self.surfaced)
+        tiles = [("score", str(int(round(self.shown_score))), self.score_pop),
+                 ("surfaced", goal_txt, 0.0),
+                 ("inversions", str(inversions(self.board.values())), self.swap_pop),
+                 ("chain", f"×{max(self.chain, 1)}" if self.chain else "-", 0.0)]
         gap, ty = 10, 132 + off
         tw = (inner - gap * (len(tiles) - 1)) / len(tiles)
-        for k, (name, value, sub) in enumerate(tiles):
-            r = pygame.Rect(int(x + k * (tw + gap)), ty, int(tw), 70)
-            hot = name == "swaps" and self.swap_pop > 0
-            hurry = name == "time" and self.time_left < 10 and not self.result
-            border = th.bad if hurry else th.accent if hot else None
-            self.card(r, 0.07, 220, 12, (*border, 200) if border else None)
+        for k, (name, value, pop) in enumerate(tiles):
+            tin = self.ent(k + 1, step=0.05)
+            r = pygame.Rect(int(x + k * (tw + gap)), ty + int(30 * (1 - tin)), int(tw), 68)
+            border = th.accent if pop > 0 else None
+            self.card(r, 0.07, 220, 12, (*border, int(200 * pop)) if border else None)
             self.caps(name, r.x + 12, r.y + 9, th.dim)
-            col = th.bad if hurry else lerp_color(th.text, th.accent, self.swap_pop) if name == "swaps" else th.text
-            scale = 1.0
-            if name == "swaps" and self.swap_pop > 0:
-                scale += math.sin(math.pi * self.swap_pop) * 0.2
-            if hurry:
-                scale += 0.15 * (self.time_left % 1) ** 3
+            col = lerp_color(th.text, th.accent, pop)
+            if name == "chain" and self.chain >= 2:
+                col = th.accent
+            scale = 1.0 + math.sin(math.pi * pop) * 0.2
             self.text(value, self.f_value, col, r.x + 12, r.y + 26, scale=scale)
-            if sub:
-                img = self.f_tiny.render(sub.upper(), True, th.dim)
-                s.blit(img, img.get_rect(bottomright=(r.right - 10, r.bottom - 9)))
-            if name == "swaps" and self.limit is not None and not self.demo:
-                frac = min(1.0, self.swaps / max(1, self.limit))     # budget bar
-                pygame.draw.rect(s, lerp_color(th.panel_bg, (0, 0, 0), 0.3), (r.x + 10, r.bottom - 6, r.w - 20, 3))
-                pygame.draw.rect(s, th.bad if frac > 0.8 else th.accent,
-                                 (r.x + 10, r.bottom - 6, int((r.w - 20) * frac), 3))
+            if name == "surfaced" and lv.goal:              # progress bar
+                frac = self.smooth("goalbar", min(1.0, self.surfaced / lv.goal), 8)
+                pygame.draw.rect(s, lerp_color(th.panel_bg, (0, 0, 0), 0.3), (r.x + 10, r.bottom - 7, r.w - 20, 3))
+                pygame.draw.rect(s, th.good, (r.x + 10, r.bottom - 7, int((r.w - 20) * frac), 3))
+
+        # --- the three star goals
+        gy = 210 + off
+        gw = (inner - 2 * 8) / 3
+        if self.endless:
+            goals = [(f"best {self.save.get('endless', 0)}", self.score > self.save.get("endless", 0), False),
+                     (f"best chain ×{self.best_chain}", self.best_chain >= 3, False),
+                     ("clean" if self.wrong == 0 else f"{self.wrong} wrong", self.wrong == 0, self.wrong > 0)]
+        else:
+            goals = [(f"surface {lv.goal}", self.surfaced >= lv.goal, False),
+                     (f"chain ×{lv.chain}", self.best_chain >= lv.chain, False),
+                     ("no wrong swaps" if self.wrong == 0 else f"{self.wrong} wrong swap{'s' * (self.wrong > 1)}",
+                      self.wrong == 0, self.wrong > 0)]
+        for k, (label, ok, broken) in enumerate(goals):
+            r = pygame.Rect(int(x + k * (gw + 8)), gy, int(gw), 30)
+            lit = self.smooth(f"goal{k}", 1.0 if ok else 0.0, 8)
+            col = th.bad if broken else lerp_color(th.dim, th.accent, lit)
+            self.card(r, 0.04, 200, 15, (*col, 120 + int(100 * lit)))
+            self.draw_star(r.x + 17, r.centery, 8, ok, 1 + 0.25 * lit * (0.5 + 0.5 * math.sin(self.t * 5)))
+            if broken:
+                pygame.draw.line(s, th.bad, (r.x + 9, r.centery + 7), (r.x + 25, r.centery - 7), 2)
+            img = self.f_tiny.render(label.upper(), True, th.bad if broken else lerp_color(th.dim, th.text, lit))
+            s.blit(img, img.get_rect(midleft=(r.x + 31, r.centery)))
 
         # --- message card (slides in when it changes)
         if self.message != self.shown_msg:
             self.shown_msg, self.msg_age = self.message, 0.0
         k = ease_in_out(min(1.0, self.msg_age / 0.25))
         kind_col = {"good": th.good, "bad": th.bad, "swap": th.bad}.get(self.msg_kind, th.accent)
-        mr = pygame.Rect(x, 214 + off, inner, 62)
+        mr = pygame.Rect(x, 252 + off, inner, 58)
         self.card(mr, 0.04, 220, 12)
         pygame.draw.rect(s, kind_col, (mr.x, mr.y, 5, mr.h), border_top_left_radius=12, border_bottom_left_radius=12)
-        lines = self.wrap(self.message, 50)[:2]
+        lines = self.wrap(self.message, self.f_small, inner - 40)[:2]
         my = mr.centery - len(lines) * 10
         for line in lines:
             my = self.text(line, self.f_small, th.text, mr.x + 18 + int(10 * (1 - k)), my, 255 * k) - 4
 
         # --- pseudocode card
-        cr = pygame.Rect(x, 288 + off, inner, 196)
+        cr = pygame.Rect(x, 320 + off, inner, 184)
         self.card(cr, -0.35, 200, 12)
-        self.caps("pseudocode", cr.x + 14, cr.y + 10, th.dim)
+        self.caps("bubble sort", cr.x + 14, cr.y + 10, th.dim)
         if self.demo and self.demo_step:
             _, jj, ii = self.demo_step
-            vars_txt = f"i={ii}  j={jj}  swapped={self.demo_swapped}"
-            img = self.f_code.render(vars_txt, True, th.accent)
+            img = self.f_code.render(f"i={ii}  j={jj}  swapped={self.demo_swapped}", True, th.accent)
             s.blit(img, img.get_rect(topright=(cr.right - 14, cr.y + 7)))
-        line_h, y0 = 20, cr.y + 34
+        else:
+            img = self.f_tiny.render("BEST O(N) · WORST O(N²) · STABLE", True, lerp_color(th.dim, th.panel_bg, 0.3))
+            s.blit(img, img.get_rect(topright=(cr.right - 14, cr.y + 10)))
+        line_h, y0 = 20, cr.y + 32
         active = STEP_LINE.get(self.demo_step[0], -1) if (self.demo and self.demo_step) else -1
+        hl_col = th.code_hl
+        if active < 0 and self.code_flash:          # your own swap lights up its line
+            active, fc, age = self.code_flash
+            hl_col = lerp_color(th.panel_bg, fc, 0.45 * (1 - age / 0.9))
         if active >= 0:                            # highlight glides between lines
             target = y0 + active * line_h
             self.hl_y = target if self.hl_y is None else approach(self.hl_y, target, self.dt, 18)
-            pygame.draw.rect(s, th.code_hl, (cr.x + 8, self.hl_y - 2, cr.w - 16, line_h), border_radius=5)
+            pygame.draw.rect(s, hl_col, (cr.x + 8, self.hl_y - 2, cr.w - 16, line_h), border_radius=5)
             pygame.draw.rect(s, th.accent, (cr.x + 8, self.hl_y - 2, 3, line_h), border_radius=2)
         for idx, line in enumerate(PSEUDOCODE):
             ly = y0 + idx * line_h
@@ -1361,89 +1809,85 @@ class Game:
             self.text(line, self.f_code, th.accent if idx == active else lerp_color(th.text, th.dim, 0.35),
                       cr.x + 40, ly)
 
-        # --- complexity chips
-        cx = x
-        for c in ("best O(n)", "worst O(n²)", "memory O(1)", "stable"):
-            cx += self.chip(c, cx, 494 + off, th.dim) + 6
-
         # --- controls as keycaps, two columns
-        self.caps("controls", x, 530 + off, th.dim)
-        if self.demo:
+        self.caps("controls", x, 516 + off, th.dim)
+        if self.demo or self.demo_finale:
             rows = [((["SPACE"], "pause"), (["→"], "step")),
                     ((["+", "-"], "speed"), (["D"], "stop demo")),
                     ((["R"], "restart"), (["N"], "next level")),
-                    ((["T"], "theme"), (["ESC"], "levels"))]
+                    ((["T"], "theme"), (["ESC"], "back"))]
         else:
             rows = [((["↑", "↓"], "choose pair"), (["SPACE"], "swap")),
-                    ((["D"], "watch demo"), (["R"], "restart")),
-                    ((["N"], "next level"), (["T"], "theme")),
-                    ((["ESC"], "levels"), (["CLICK"], "select / swap"))]
+                    ((["F"], "next one now"), (["D"], "watch demo")),
+                    ((["R"], "restart"), (["N"], "next level")),
+                    ((["T"], "theme"), (["ESC"], "back"))]
         for r_i, row in enumerate(rows):
-            ry = 550 + off + r_i * 29
+            ry = 536 + off + r_i * 29
             for c_i, (keys, label) in enumerate(row):
                 kx = x + c_i * (inner // 2)
                 for key in keys:
                     kx += self.keycap(key, kx, ry) + 4
                 img = self.f_small.render(label, True, th.text)
-                s.blit(img, (kx + 4, ry + 1))
+                s.blit(img, img.get_rect(midleft=(kx + 4, ry + 11)))
 
     def draw_result(self):
         """Result card: pops in with a springy scale, stars appear one by one."""
         s, th, age = self.screen, self.theme, self.result_age
-        if age < 0.15:                       # let the last swap finish first
+        if age < 0.15:
             return
         age -= 0.15
-        card = pygame.Surface((420, 236), pygame.SRCALPHA)
+        card = pygame.Surface((420, 250), pygame.SRCALPHA)
         pygame.draw.rect(card, (*th.panel_bg, 252), card.get_rect(), border_radius=12)
         border = th.bad if self.result == "failed" else th.accent
         pygame.draw.rect(card, border, card.get_rect(), 3, border_radius=12)
-        cx, y = card.get_width() // 2, 16
+        cx, y = card.get_width() // 2, 14
         bottom = card.get_height() - 30
         ct = self.center_text
         if self.result == "won":
-            y = ct("Sorted!", self.f_big, th.accent, cx, y, card)
+            y = ct("Tank cleared!", self.f_big, th.accent, cx, y, card)
+            labels = ["cleared", f"chain ×{self.level.chain}", "clean"]
+            got = [True, self.best_chain >= self.level.chain, self.wrong == 0]
             for k in range(3):                # stars pop in one after another
                 p = (age - 0.25 - k * 0.18) / 0.3
+                sx = cx + (k - 1) * 110
+                lab = self.f_tiny.render(labels[k].upper(), True, th.text if got[k] else th.dim)
+                card.blit(lab, lab.get_rect(midtop=(sx, y + 44)))
                 if p <= 0:
                     continue
-                sc = ease_out_back(min(1.0, p))
-                full = k < self.earned
-                img = self.f_big.render("★" if full else "☆", True, th.accent if full else th.dim)
-                img = pygame.transform.smoothscale_by(img, max(0.05, sc))
-                card.blit(img, img.get_rect(center=(cx + (k - 1) * 44, y + 20)))
-            y += 46
-            y = ct(f"{self.swaps} swaps (minimum: {self.opt_swaps})", self.f_mid, th.text, cx, y, card)
+                self.draw_star(sx, y + 20, 20, got[k], max(0.05, ease_out_back(min(1.0, p))), card)
+            y += 70
+            y = ct(f"Score {self.score}   ·   {self.swaps} swaps", self.f_mid, th.text, cx, y, card)
             if self.new_record:
-                y = ct("New personal best!", self.f_small, th.good, cx, y, card)
-            elif self.earned < 3:
-                y = ct("Match the minimum for 3 stars.", self.f_small, th.dim, cx, y, card)
-            if any(e.label for e in self.board.items):
-                ok = self.board.is_stable()
-                ct("Stable: twins kept their order (a, b, c)" if ok else "Not stable: the twins changed order!",
-                   self.f_small, th.good if ok else th.bad, cx, y, card)
+                ct("New personal best!", self.f_small, th.good, cx, y, card)
             nxt = "N next level   " if self.level_idx + 1 < len(LEVELS) else ""
             ct(nxt + "R again   ESC levels", self.f_small, th.dim, cx, bottom, card)
         elif self.result == "failed":
-            y = ct("Not this time", self.f_big, th.bad, cx, y + 10, card)
-            for line in self.wrap(self.fail_reason, 40):
-                y = ct(line, self.f_mid, th.text, cx, y + 6, card)
-            ct(f"Bubble Sort needs only {self.opt_swaps} swaps here.", self.f_small, th.dim, cx, y + 10, card)
-            ct("R try again   D watch demo   ESC levels", self.f_small, th.dim, cx, bottom, card)
+            y = ct("Game over" if self.endless else "Not this time", self.f_big, th.bad, cx, y + 6, card)
+            for line in self.wrap(self.fail_reason, self.f_mid, 380):
+                y = ct(line, self.f_mid, th.text, cx, y + 4, card)
+            y = ct(f"Score {self.score}   ·   surfaced {self.surfaced}", self.f_mid, th.accent, cx, y + 8, card)
+            if self.endless:
+                ct("New high score!" if self.new_record else f"High score {self.save.get('endless', 0)}",
+                   self.f_small, th.good if self.new_record else th.dim, cx, y + 4, card)
+            else:
+                ct("Tip: carry the biggest one up first.", self.f_small, th.dim, cx, y + 4, card)
+            ct("R try again   D watch demo   ESC back", self.f_small, th.dim, cx, bottom, card)
         else:
             y = ct("Demo finished", self.f_big, th.accent, cx, y + 10, card)
-            y = ct(f"{self.opt_comps} comparisons, {self.opt_swaps} swaps", self.f_mid, th.text, cx, y + 6, card)
+            y = ct(f"{self.swaps} swaps = {inversions(self.start_values)} inversions", self.f_mid, th.text, cx, y + 6, card)
             ct("Now try it yourself!", self.f_mid, th.good, cx, y + 10, card)
-            ct("R play   ESC levels", self.f_small, th.dim, cx, bottom, card)
+            ct("R play   ESC back", self.f_small, th.dim, cx, bottom, card)
 
         p = min(1.0, age / 0.4)
         center = (PANEL_X + (W - PANEL_X - 20) // 2, H // 2)   # over the panel, not the column
         veil = pygame.Surface((W - PANEL_X - 20, H - 40), pygame.SRCALPHA)
-        pygame.draw.rect(veil, (0, 0, 0, int(110 * p)), veil.get_rect(), border_radius=14)
+        pygame.draw.rect(veil, (0, 0, 0, int(120 * p)), veil.get_rect(), border_radius=14)
         s.blit(veil, (PANEL_X, 20))
         self.glow_rect(card.get_rect(center=center), border, p, 12)
         img = pygame.transform.smoothscale_by(card, max(0.05, ease_out_back(p)))
         img.set_alpha(int(255 * min(1.0, p * 2)))
         s.blit(img, img.get_rect(center=center))
+
 
 if __name__ == "__main__":
     Game().run()
