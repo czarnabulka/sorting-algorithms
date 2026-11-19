@@ -32,7 +32,11 @@ In a level:
 Anywhere:
   F11 / Alt+Enter     fullscreen on / off (remembered in save.json)
   Settings (menu)     fullscreen, smooth / sharp scaling, theme, auto-pause,
-                      rules card before the first try
+                      rules card before the first try, weather
+
+Weather (levels with arrivals, see weather.py):
+  Aquarium currents swap a pair, Garden showers speed up arrivals,
+  Fire heat waves hide the numbers but double the points.
 
 Run:
   pip install pygame
@@ -50,6 +54,7 @@ import pygame
 from fonts import load_fontsets
 from levels import ENDLESS, LEVELS, VMAX, Feed, make_values
 from themes import THEMES, W, H, lerp_color
+from weather import WEATHER
 
 FPS = 60
 COL_X = 250            # x centre of the element column
@@ -152,7 +157,8 @@ def approach(cur, target, dt, speed=12.0):
 # ------------------------------------------------------------------ saving
 def load_save():
     blank = {"version": 2, "stars": {}, "best": {}, "theme": "aquarium", "endless": 0,
-             "fullscreen": False, "sharp": False, "autopause": True, "briefing": True}
+             "fullscreen": False, "sharp": False, "autopause": True, "briefing": True,
+             "weather": True}
     try:
         with open(SAVE_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -240,13 +246,14 @@ class Board:
             e.from_y, e.to_y = e.y, self.slot_y(idx)
             e.anim, e.side = 0.0, side
 
-    def arrive(self, v):
-        """A new element enters at the bottom and pushes the others up."""
+    def arrive(self, v, delay=0):
+        """A new element enters at the bottom and pushes the others up.
+        `delay` starts it further below, so elements of a batch come one by one."""
         for e in self.items:
             if e.anim < 1:
                 e.from_y -= self.step
                 e.to_y -= self.step
-        e = self.make(v, self.bottom + 110)
+        e = self.make(v, self.bottom + 110 + 70 * delay)
         e.pop = 1.0
         self.items.insert(0, e)
         return e
@@ -611,6 +618,20 @@ class Game:
         elif kind == "rising":
             pygame.draw.lines(s, color, False, [(cx - 7, cy + 6), (cx - 2, cy + 1), (cx + 1, cy + 3), (cx + 7, cy - 5)], 2)
             pygame.draw.polygon(s, color, [(cx + 8, cy - 7), (cx + 2, cy - 6), (cx + 7, cy - 1)])
+        elif kind == "wave":
+            for dy in (-4, 3):
+                pts = [(cx - 8 + k * 2, cy + dy + 2.5 * math.sin(k * 1.1)) for k in range(9)]
+                pygame.draw.lines(s, color, False, pts, 2)
+        elif kind == "cloud":
+            for ox, oy, r in ((-4, 1, 4), (1, -2, 5), (5, 1, 4)):
+                pygame.draw.circle(s, color, (cx + ox, cy + oy), r, 2)
+            for k in (-4, 0, 4):
+                pygame.draw.line(s, color, (cx + k, cy + 6), (cx + k - 1, cy + 9), 2)
+        elif kind == "flame":
+            pts = [(cx - 6, cy + 7), (cx - 7, cy + 1), (cx - 4, cy - 4), (cx - 2, cy), (cx, cy - 9),
+                   (cx + 3, cy - 2), (cx + 5, cy - 5), (cx + 7, cy + 1), (cx + 6, cy + 7)]
+            pygame.draw.polygon(s, color, pts, 2)
+            pygame.draw.line(s, color, (cx, cy + 6), (cx, cy + 2), 2)
         elif kind == "clock":
             pygame.draw.circle(s, color, (cx, cy), 7, 2)
             pygame.draw.line(s, color, (cx, cy), (cx, cy - 4), 2)
@@ -636,7 +657,8 @@ class Game:
         if lv.spawn:
             rules.append(("clock", "Arrivals",
                           f"A new {th.noun} enters at the bottom every {lv.spawn:g} s (watch the NEXT box). "
-                          "If the tank is full when it comes, the tank overflows and you lose."))
+                          "If the tank is full when it comes, the tank overflows and you lose. "
+                          "When it is almost empty, a batch of three pours in."))
             if lv.speedup < 1:
                 rules.append(("speed", "Speeding up",
                               f"Each arrival comes {round((1 - lv.speedup) * 100)}% sooner than the one "
@@ -657,7 +679,17 @@ class Game:
                           "cracks the tank: the level is lost at once."))
         if lv.hidden:
             rules.append(("eye", "Hidden numbers", "The numbers are not shown. Compare the sizes instead."))
+        wx = self.weather_for(lv)
+        if wx:
+            rules.append((wx["icon"], f"Weather: {wx['name'].lower()}",
+                          wx["desc"] + " Other themes bring other weather."))
         return rules
+
+    def weather_for(self, lv, theme=None):
+        """The weather of a theme in a level, or None (off, or no arrivals)."""
+        if not self.save.get("weather", True) or not lv.spawn:
+            return None
+        return WEATHER.get((theme or self.theme).key)
 
     def level_goals(self, lv):
         if lv.goal is None:
@@ -1356,13 +1388,17 @@ class Game:
             ("Rules first", ["Off", "On"], int(sv.get("briefing", True)),
              lambda v: self.set_flag("briefing", v == 1),
              "Show the rules card before your first try of a level."),
+            ("Weather", ["Off", "On"], int(sv.get("weather", True)),
+             lambda v: self.set_flag("weather", v == 1),
+             "In levels with arrivals each theme has weather: currents (Aquarium), "
+             "rain showers (Garden), heat waves (Fire)."),
         ]
 
     def settings_rect(self, k):
-        return pygame.Rect(150, 150 + k * 74, W - 300, 60)
+        return pygame.Rect(150, 128 + k * 66, W - 300, 56)
 
     def settings_back_rect(self):
-        return pygame.Rect(W // 2 - 110, 150 + 5 * 74 + 14, 220, 52)
+        return pygame.Rect(W // 2 - 110, 128 + 6 * 66 + 8, 220, 50)
 
     def option_rects(self, k, n):
         r = self.settings_rect(k)
@@ -1445,7 +1481,7 @@ class Game:
                 s.blit(img, img.get_rect(center=o.center))
         # back button
         b = Button(self.settings_back_rect(), "Back", lambda: None)
-        self.draw_button(b, self.sel == len(items), "setback", int(120 * (1 - self.ent(7, step=0.05))))
+        self.draw_button(b, self.sel == len(items), "setback", int(120 * (1 - self.ent(8, step=0.05))))
         # description of the selected row
         if self.sel < len(items):
             desc = items[self.sel][4]
@@ -1482,6 +1518,15 @@ class Game:
             self.otext(fs["head"], th.title, (b.rect.centerx, b.rect.y + 34), th.accent, 2)
             for n, line in enumerate(self.wrap(th.tagline, fs["small"], b.rect.w - 30)):
                 self.otext(fs["small"], line, (b.rect.centerx, b.rect.y + 72 + n * 20), th.text, 1)
+            wx = WEATHER.get(th.key)
+            if wx:
+                ic = pygame.Surface((24, 24), pygame.SRCALPHA)
+                self.draw_icon(wx["icon"], 12, 12, th.accent, ic)
+                cap = self.outlined(fs["tiny"], "WEATHER", th.accent, OUTLINE, 1)
+                x0 = b.rect.centerx - (cap.get_width() + 26) // 2
+                s.blit(ic, (x0, b.rect.y + 122 - 12))
+                s.blit(cap, cap.get_rect(midleft=(x0 + 26, b.rect.y + 122)))
+                self.otext(fs["small"], wx["short"], (b.rect.centerx, b.rect.y + 142), th.text, 1)
             if k == self.theme_idx:
                 self.otext(fs["small"], "current", (b.rect.centerx, b.rect.bottom - 20), th.accent, 1)
         self.otext(self.f_small, "←→ choose   ENTER apply   ESC back", (W // 2, H - 40), self.theme.dim, 1)
@@ -1569,6 +1614,122 @@ class Game:
         else:
             self.message = f"The biggest {th.noun} on top surfaces. Empty the tank!"
         self.msg_kind = "info"
+        self.init_weather()
+
+    # --- weather
+    def init_weather(self):
+        self.wx = self.weather_for(self.level)
+        self.wx_key = self.theme.key if self.wx else None
+        self.wx_rng = random.Random(self.seed * 7 + len(self.theme.key))
+        self.wx_phase = "calm"
+        self.wx_t = self.wx_rng.uniform(*self.wx["calm"]) if self.wx else 0.0
+        self.wx_pair = None           # uids of the pair a current will hit
+        self.wx_strike = 0.0          # 1 -> 0 after a current struck
+        self.wx_strike_y = 0.0
+        self.wx_drops = []            # heavy rain streaks during a shower
+
+    def wx_on(self, kind, phase="active"):
+        return bool(self.wx) and self.wx["kind"] == kind and self.wx_phase == phase
+
+    def heat_on(self):
+        return self.wx_on("heat")
+
+    def hidden_now(self):
+        return self.level.hidden or self.heat_on()
+
+    def spawn_rate(self):
+        if self.wx and self.wx["kind"] == "rain":
+            return self.wx["rate"][self.wx_phase]
+        return 1.0
+
+    def current_pair(self):
+        """Index j of the pair the current is aiming at, or None if the two
+        are not neighbours any more."""
+        if not self.wx_pair:
+            return None
+        idx = {e.uid: i for i, e in enumerate(self.board.items)}
+        a, b = (idx.get(u) for u in self.wx_pair)
+        if a is None or b is None or abs(a - b) != 1:
+            return None
+        return min(a, b)
+
+    def update_weather(self, dt):
+        wx, b, th = self.wx, self.board, self.theme
+        self.wx_t -= dt
+        if self.wx_phase == "calm" and self.wx_t <= 0:
+            if wx["kind"] == "current":
+                if b.n < 2:
+                    self.wx_t = 1.0
+                    return
+                v = b.values()
+                calm_pairs = [j for j in range(b.n - 1) if v[j] <= v[j + 1]]
+                pool = calm_pairs if calm_pairs and self.wx_rng.random() < 0.65 else list(range(b.n - 1))
+                j = self.wx_rng.choice(pool)
+                self.wx_pair = (b.items[j].uid, b.items[j + 1].uid)
+                self.message = "A current is coming! Waves show the pair it will swap."
+            elif wx["kind"] == "rain":
+                self.message = "Clouds are gathering: a shower will bring drops twice as fast."
+            else:
+                self.message = "It is heating up: soon the numbers will vanish, but points double."
+            self.msg_kind = "bad"
+            self.wx_phase, self.wx_t = "warn", wx["warn"]
+        elif self.wx_phase == "warn" and self.wx_t <= 0:
+            if wx["kind"] == "current":
+                if b.busy:
+                    self.wx_t = 0.0
+                    return
+                self.current_strike()
+                self.wx_phase, self.wx_t = "calm", self.wx_rng.uniform(*wx["calm"])
+            else:
+                self.wx_phase, self.wx_t = "active", wx["active"]
+                self.message = ("Shower! New drops are pouring in." if wx["kind"] == "rain"
+                                else "Heat wave! Numbers are hidden, every surfacing scores double.")
+                self.msg_kind = "bad"
+        elif self.wx_phase == "active" and self.wx_t <= 0:
+            self.wx_phase, self.wx_t = "calm", self.wx_rng.uniform(*wx["calm"])
+            self.message = ("The shower is over, the sun is back." if wx["kind"] == "rain"
+                            else "The heat fades and the numbers return.")
+            self.msg_kind = "info"
+        # rain streaks during a shower
+        if wx["kind"] == "rain":
+            heavy = self.wx_phase == "active"
+            if heavy:
+                for _ in range(6):
+                    self.wx_drops.append([random.uniform(-80, W), random.uniform(-40, -10),
+                                          random.uniform(900, 1300)])
+            for d in self.wx_drops:
+                d[1] += d[2] * dt
+                d[0] += d[2] * 0.2 * dt
+            self.wx_drops = [d for d in self.wx_drops if d[1] < H + 20]
+
+    def current_strike(self):
+        b, th = self.board, self.theme
+        j = self.current_pair()
+        self.wx_pair = None
+        self.wx_strike = 1.0
+        if j is None:
+            self.message = "You dodged the current!"
+            self.msg_kind = "good"
+            return
+        a, c = b.items[j].value, b.items[j + 1].value
+        b.swap(j)
+        self.ready_t = 0.0
+        y = (b.slot_y(j) + b.slot_y(j + 1)) / 2
+        th.burst(COL_X - 60, y, 10)
+        th.burst(COL_X + 60, y, 10)
+        self.wx_strike_y = y
+        if self.hidden_now():
+            self.message = "The current swapped a pair!"
+            self.msg_kind = "swap"
+        elif a > c:
+            self.message = f"The current swapped {a} and {c}: lucky, that helped!"
+            self.msg_kind = "good"
+        elif a == c:
+            self.message = f"The current swapped two {a}s: nothing changed."
+            self.msg_kind = "info"
+        else:
+            self.message = f"The current swapped {a} and {c}: now they are out of order!"
+            self.msg_kind = "bad"
 
     # --- the rules
     def surface_ready(self):
@@ -1592,11 +1753,13 @@ class Game:
         self.chain += 1
         self.chain_t = 1.1
         self.best_chain = max(self.best_chain, self.chain)
-        pts = 10 * e.value * self.chain
+        pts = 10 * e.value * min(self.chain, self.MAX_MULT) * (2 if self.heat_on() else 1)
         self.score += pts
         self.score_pop = 1.0
         self.surfaced += 1
         txt = f"+{pts}" if self.chain < 2 else f"+{pts}  ×{self.chain}"
+        if self.heat_on():
+            txt += "  hot!"
         self.popups.append({"txt": txt, "x": x + 70, "y": SURFACE_Y + 20, "age": 0.0, "col": th.accent})
         if self.chain >= 2:
             self.banner = [f"CHAIN ×{self.chain}", 0.0]
@@ -1635,6 +1798,34 @@ class Game:
             self.message = "The tank is full! Surface something before the next one arrives."
             self.msg_kind = "bad"
 
+    REFILL = 3                 # an (almost) empty tank is topped up to this many
+    MAX_MULT = 8               # chain multiplier cap for points
+
+    def refill(self):
+        """The tank is (almost) empty: a lone newcomer would always be the
+        biggest and surface for free, so a small batch comes in at once.
+        The biggest of the batch enters last and ends at the bottom, so it
+        still has to be carried up."""
+        b, th = self.board, self.theme
+        k = min(self.REFILL, b.cap) - b.n
+        if k <= 0:
+            return
+        batch = [self.queue.pop(0) for _ in range(k)]
+        for _ in range(k):
+            self.queue.append(self.feed.next(b.values() + self.queue + batch))
+        big = max(range(k), key=lambda i: batch[i])
+        batch.append(batch.pop(big))
+        for i, v in enumerate(batch):
+            b.arrive(v, delay=i)
+        self.cursor = 0
+        self.ready_t = 0.0
+        self.chain, self.chain_t = 0, 0.0         # a new batch starts a new chain
+        self.spawn_every = max(self.level.min_spawn, self.spawn_every * self.level.speedup)
+        self.spawn_t = self.spawn_every
+        th.burst(COL_X, b.bottom + 20, 16)
+        self.message = f"Almost empty: a batch of {k} {th.nouns} poured in. Carry the biggest up!"
+        self.msg_kind = "info"
+
     def call_next(self):
         if self.level.spawn and not self.result and not self.demo and not self.demo_finale:
             self.arrive(early=True)
@@ -1653,7 +1844,7 @@ class Game:
         y = (b.slot_y(j) + b.slot_y(j + 1)) / 2
         if a > c:
             self.message = f"{a} > {c}: swap! {a} {th.rise_verb}."
-            if self.level.hidden:
+            if self.hidden_now():
                 self.message = f"Good swap: the bigger one {th.rise_verb}."
             self.msg_kind = "good"
             self.code_flash = [4, th.good, 0.0]
@@ -1664,7 +1855,7 @@ class Game:
         self.code_flash = [3, th.bad, 0.0]
         if a == c:
             self.message = f"{a} = {c}: Bubble Sort never swaps equal values. That keeps it stable!"
-        elif self.level.hidden:
+        elif self.hidden_now():
             self.message = "Wrong swap: the smaller one went up."
         else:
             self.message = f"{a} < {c}: that swap breaks the order!"
@@ -1883,9 +2074,18 @@ class Game:
             if self.chain_t <= 0:
                 self.chain = 0
 
+        # weather (re-chosen when the theme or the setting changes)
+        if (self.weather_for(self.level) or None) is not self.wx:
+            self.init_weather()
+        self.wx_strike = max(0.0, self.wx_strike - dt * 2)
+        if playing and self.wx and not self.demo_finale:
+            self.update_weather(dt)
+
         # arrivals
         if playing and self.spawn_t is not None and not self.demo_finale:
-            self.spawn_t -= dt
+            if self.board.n <= 1 and not self.board.busy:
+                self.refill()
+            self.spawn_t -= dt * self.spawn_rate()
             if self.spawn_t <= 0:
                 self.arrive()
 
@@ -2030,7 +2230,7 @@ class Game:
             if k == 0 and frac > 0.8 and not self.result and self.spawn_t is not None:
                 y += math.sin(self.t * 40) * 2 * (frac - 0.8) * 5         # jitters before it drops in
             th.draw_element(s, self.f_elem if k == 0 else self.f_small, r0.centerx, y, rr, v, VMAX,
-                            self.t, None, "", k, self.level.hidden)
+                            self.t, None, "", k, self.hidden_now())
         # timer ring around the first one
         cx, cy, R = r0.centerx, ys[0], 34
         pygame.draw.circle(s, lerp_color(th.panel_bg, (0, 0, 0), 0.3), (cx, cy), R, 4)
@@ -2044,8 +2244,118 @@ class Game:
         img = self.f_tiny.render("NOW +", True, th.dim)
         s.blit(img, (kx + kw + 6, r0.bottom - 22))
 
+    _tint_cache = {}
+
+    def tint(self, color, alpha):
+        """Full-screen colour wash (cached per colour and alpha step)."""
+        key = (tuple(color), int(alpha) // 4)
+        img = self._tint_cache.get(key)
+        if img is None:
+            if len(self._tint_cache) > 200:
+                self._tint_cache.clear()
+            img = pygame.Surface((W, H), pygame.SRCALPHA)
+            img.fill((*color, key[1] * 4))
+            self._tint_cache[key] = img
+        self.screen.blit(img, (0, 0))
+
+    def wx_level(self):
+        """0..1: how strong the weather looks right now (fades in and out)."""
+        if not self.wx or self.wx["kind"] == "current":
+            return 0.0
+        target = {"calm": 0.0, "warn": 0.35, "active": 1.0}[self.wx_phase]
+        return self.smooth("wxlevel", target, 2.5)
+
+    def draw_weather_back(self):
+        """Weather over the background, under the tank."""
+        k = self.wx_level()
+        if k < 0.01:
+            return
+        if self.wx["kind"] == "rain":
+            self.tint((10, 20, 40), 110 * k)
+        else:
+            pulse = 0.75 + 0.25 * math.sin(self.t * 5)
+            self.tint((255, 110, 20), 70 * k * pulse)
+
+    def draw_weather_front(self, dx):
+        """Weather over the elements: shower streaks, heat shimmer, current waves."""
+        s, th, b = self.screen, self.theme, self.board
+        if self.wx and self.wx["kind"] == "rain" and self.wx_drops:
+            layer = pygame.Surface((W, H), pygame.SRCALPHA)
+            for x, y, v in self.wx_drops:
+                pygame.draw.line(layer, (200, 230, 255, 150), (x, y), (x - 6, y - 30), 2)
+            s.blit(layer, (0, 0))
+        if self.heat_on() or self.wx_on("heat", "warn"):
+            k = 1.0 if self.heat_on() else 0.4
+            layer = pygame.Surface((220, BOTTOM - TOP + 120), pygame.SRCALPHA)
+            for n in range(9):                       # rising shimmer lines in the tank
+                y = (n * 70 - self.t * 60) % layer.get_height()
+                pts = [(x, y + 4 * math.sin(x / 14 + self.t * 6 + n)) for x in range(0, 221, 10)]
+                pygame.draw.lines(layer, (255, 220, 160, int(60 * k)), False, pts, 2)
+            s.blit(layer, (COL_X - 110 + dx, TOP - 60))
+        j = self.current_pair() if self.wx_on("current", "warn") else None
+        if j is not None:                            # waves aim at the pair a current will swap
+            k = 1 - max(0.0, self.wx_t) / self.wx["warn"]
+            y1, y2 = b.slot_y(j), b.slot_y(j + 1)
+            layer = pygame.Surface((W, H), pygame.SRCALPHA)
+            for n in range(5):
+                yy = y2 + (y1 - y2) * (n + 0.5) / 5
+                x0 = COL_X - 150 + dx
+                pts = [(x0 + x, yy + 5 * math.sin(x / 16 - self.t * 9 + n))
+                       for x in range(0, 300, 6)]
+                pygame.draw.lines(layer, (220, 245, 255, int(60 + 150 * k)), False, pts, 2)
+            s.blit(layer, (0, 0))
+            img = self.f_tiny.render("CURRENT", True, (20, 30, 50))
+            tag = pygame.Rect(0, 0, img.get_width() + 16, img.get_height() + 8)
+            tag.midleft = (COL_X + 152 + dx, (y1 + y2) / 2)
+            pygame.draw.rect(s, lerp_color(th.text, th.bad, 0.5 + 0.5 * math.sin(self.t * 12)), tag,
+                             border_radius=tag.h // 2)
+            s.blit(img, img.get_rect(center=tag.center))
+        if self.wx_strike > 0:                       # a flash where the current hit
+            r = int(40 + 120 * (1 - self.wx_strike))
+            ring = pygame.Surface((r * 2 + 6, r * 2 + 6), pygame.SRCALPHA)
+            pygame.draw.ellipse(ring, (220, 245, 255, int(200 * self.wx_strike)), ring.get_rect(), 3)
+            s.blit(ring, (COL_X + dx - r - 3, self.wx_strike_y - r - 3))
+
+    def draw_weather(self):
+        """The weather box in the top-left corner."""
+        if not self.wx:
+            return
+        s, th, wx = self.screen, self.theme, self.wx
+        e_in = self.ent(3, dur=0.5)
+        r = pygame.Rect(18 - int(140 * (1 - e_in)), 40, 104, 132)
+        phase = self.wx_phase
+        flash = 0.5 + 0.5 * math.sin(self.t * 10)
+        col = {"calm": th.dim, "warn": lerp_color(th.accent, wx["color"], flash), "active": wx["color"]}[phase]
+        if phase != "calm":
+            self.glow_rect(r, col, 0.6, 16)
+        self.card(r, 0.04, 210, 16, (*col, 170))
+        self.caps("weather", r.centerx, r.y + 9, th.accent, "midtop")
+        ic = pygame.Surface((24, 24), pygame.SRCALPHA)
+        self.draw_icon(wx["icon"], 12, 12, col if phase != "calm" else th.text, ic)
+        ic = pygame.transform.smoothscale_by(ic, 2.0)
+        bob = math.sin(self.t * (8 if phase != "calm" else 2)) * (3 if phase != "calm" else 1.5)
+        s.blit(ic, ic.get_rect(center=(r.centerx, r.y + 50 + bob)))
+        label = wx["labels"].get(phase, phase)
+        img = self.f_small.render(label, True, col if phase != "calm" else th.text)
+        s.blit(img, img.get_rect(center=(r.centerx, r.y + 86)))
+        if phase == "calm":
+            nxt = {"current": "current", "rain": "shower", "heat": "heat"}[wx["kind"]]
+            sub = f"{nxt} in {max(0, math.ceil(self.wx_t))}s"
+        elif phase == "warn":
+            sub = "watch out!"
+        else:
+            sub = "arrivals ×2" if wx["kind"] == "rain" else "points ×2"
+        img = self.f_tiny.render(sub.upper(), True, th.dim)
+        s.blit(img, img.get_rect(center=(r.centerx, r.y + 106)))
+        total = (wx["warn"] if phase == "warn" else wx["active"] if phase == "active" else wx["calm"][1])
+        frac = clamp01(self.wx_t / max(0.1, total))
+        bar = pygame.Rect(r.x + 12, r.bottom - 12, r.w - 24, 4)
+        pygame.draw.rect(s, lerp_color(th.panel_bg, (0, 0, 0), 0.3), bar, border_radius=2)
+        pygame.draw.rect(s, col, (bar.x, bar.y, int(bar.w * frac), bar.h), border_radius=2)
+
     def draw_play(self):
         s, th = self.screen, self.theme
+        self.draw_weather_back()
         dx = int(math.sin(self.t * 60) * 8 * self.shake)
         rect = pygame.Rect(COL_X - 110 + dx, TOP - 80, 220, BOTTOM - TOP + 140)
         th.draw_container(s, rect, self.t)
@@ -2079,14 +2389,14 @@ class Game:
             pygame.draw.circle(halo, (*th.accent, int(90 * k)), (R, R), R)
             s.blit(halo, (b.x_of(e, self.t) + dx - R, e.y - R))
         b.draw(s, th, self.f_elem, self.t, self.ring_from,
-               self.level.hidden and self.result is None, dx, labels=self.level.feed == "dupes")
+               self.hidden_now() and self.result is None, dx, labels=self.level.feed == "dupes")
         for r in self.rising:                      # elements on their way out
             p = clamp01(r["age"] / 0.42)
             y = r["y0"] + (SURFACE_Y - r["y0"]) * ease_in_out(p)
             rr = int(r["r"] * (1 + 0.25 * p))
             e = r["e"]
             th.draw_element(s, self.f_elem, r["x"] + dx, y, rr, e.value, VMAX, self.t,
-                            th.accent, "", e.phase, self.level.hidden and not self.result)
+                            th.accent, "", e.phase, self.hidden_now() and not self.result)
         for x, y, age in self.rings:               # pop shock waves
             k = age / 0.5
             surf = pygame.Surface((200, 200), pygame.SRCALPHA)
@@ -2101,8 +2411,10 @@ class Game:
             sc = ease_out_back(clamp01(age / 0.3))
             alpha = 255 * clamp01((1.3 - age) / 0.35)
             self.otext(self.f_big, txt, (COL_X, TOP + 30), th.accent, 3, alpha, max(0.05, sc))
+        self.draw_weather_front(dx)
         if self.level.spawn:
             self.draw_next()
+        self.draw_weather()
         self.draw_panel()
         if self.result:
             self.draw_result()

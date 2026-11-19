@@ -5,7 +5,7 @@ One activity per week, five weeks in total.
 
 | # | Algorithm | Medium | Status |
 |---|-----------|--------|--------|
-| 1 | [Bubble Sort](01-bubble-sort/) | 🎮 Game (Pygame): 12 levels + Endless, 3 themes | ✅ Done |
+| 1 | [Bubble Sort](01-bubble-sort/) | 🎮 Game (Pygame): 12 levels + Endless, 3 themes with weather | ✅ Done |
 | 2 | Insertion Sort | 📖 Comic | ⏳ Planned |
 | 3 | Merge Sort | 🎬 Animation (Manim) | ⏳ Planned |
 | 4 | Selection Sort | 🌐 Interactive web page (p5.js) | ⏳ Planned |

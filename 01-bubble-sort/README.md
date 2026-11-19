@@ -28,7 +28,8 @@ can also be resized. The choice is remembered.
   when the 980×720 picture is stretched,
 - **Theme**,
 - **Auto-pause** when you leave the window,
-- **Rules first**: the rules card before your first try of a level.
+- **Rules first**: the rules card before your first try of a level,
+- **Weather**: theme weather in levels with arrivals (see below).
 
 All of them are saved. `--fullscreen` / `--windowed` and `--sharp` / `--smooth`
 on the command line override the saved choice.
@@ -53,7 +54,14 @@ game turns the ideas of the algorithm into rules:
 | inversions = swaps needed | the **inversions** tile counts the pairs still out of order; every good swap removes exactly one |
 | best case / worst case | levels with nearly sorted data, reversed data, and arrivals that each must cross the whole tank |
 
-Points: a surfacing element is worth `10 × value × chain`. Letting the next
+**Refill**: when only one element (or none) is left in a tank with
+arrivals, a batch tops it up to three at once. A lone newcomer would always be
+the biggest and surface for free; in a batch the biggest enters last and ends
+at the bottom, so it still has to be carried up. A batch also starts a new
+chain.
+
+Points: a surfacing element is worth `10 × value × chain` (the chain
+multiplier stops growing at ×8). Letting the next
 element in early (**F** or a click on the NEXT box) gives a small bonus, at
 the risk of a fuller tank.
 
@@ -94,6 +102,22 @@ After level 4, **Endless tide** unlocks in the main menu: arrivals keep getting
 faster until the tank overflows. Your high score is saved.
 
 ![Level map](screenshots/levels.png)
+
+## Weather
+
+In levels with arrivals (5 to 12 and Endless) every theme brings its own
+weather, so the theme is also a choice of challenge. The weather box in the
+top-left corner shows what is coming and when.
+
+| Theme | Weather | Effect |
+|-------|---------|--------|
+| 🫧 Bubble Aquarium | **Currents** | Now and then waves aim at one pair; 2.6 s later the current swaps it. It may fix an inversion or create one. Move one of the two away to dodge it. A current's swap never counts as your wrong swap. |
+| 🌧️ Rain Garden | **Rain showers** | Between showers new drops arrive 25% slower; during a short shower (5 s) they arrive twice as fast. Clouds warn you 3 s before. |
+| 🔥 Fire Pit | **Heat waves** | For 8 s the numbers vanish in the shimmer (sizes still show, like *Blindfold*), but every surfacing scores double. |
+
+Weather starts on a calm phase of 11 to 16 s and repeats with the same timing
+after a restart. It can be switched off in *Settings*. Levels 1 to 4 have no
+weather.
 
 ## Themes and fonts
 
@@ -164,6 +188,7 @@ Pick a theme in *Theme* in the main menu, or press **T** at any time.
 | `levels.py` | the 12 levels, Endless, starting data and arriving values |
 | `themes.py` | the three visual themes (background, particles, elements) |
 | `fonts.py` | per-theme fonts with a fallback for missing characters |
+| `weather.py` | the three kinds of weather: timings and texts |
 | `fonts/` | the .ttf files and their licence |
 
 ## Complexity
